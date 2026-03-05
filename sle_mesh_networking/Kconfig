@@ -1,0 +1,51 @@
+#===============================================================================
+# @brief    Kconfig file.
+# Copyright (c) @CompanyNameMagicTag 2023-2023. All rights reserved.
+#===============================================================================
+
+config SLE_UART_BUS
+    int
+    prompt "Set the UART BUS of the currrent sample."
+    default 0
+    depends on SAMPLE_SUPPORT_SLE_MESH_NETWORKING
+    help
+        This option means the UART BUS of the currrent sample.
+
+config UART_TXD_PIN
+    int
+    prompt "Choose UART TXD pin."
+    depends on SAMPLE_SUPPORT_SLE_MESH_NETWORKING
+    default 17
+
+config UART_RXD_PIN
+    int
+    prompt "Choose UART RXD pin."
+    depends on SAMPLE_SUPPORT_SLE_MESH_NETWORKING
+    default 18
+
+choice
+    prompt "Select sle mesh node type"
+    default SAMPLE_SUPPORT_SLE_MESH
+    config SAMPLE_SUPPORT_SLE_MESH_SERVER
+        bool "Enable SLE Mesh Server-only sample."
+    config SAMPLE_SUPPORT_SLE_MESH_CLIENT
+        bool "Enable SLE Mesh Client-only sample."
+    config SAMPLE_SUPPORT_SLE_MESH
+        bool "Enable SLE Mesh networking (Server + Client + Mesh)."
+endchoice
+
+# 注: Mesh 节点地址在 mesh/mesh_config.h 中的 MESH_NODE_ADDR 宏定义
+# 每个节点编译前需修改该值为不同地址 (0x0001, 0x0002, ...)
+
+config SUPPORT_SLE_PERIPHERAL
+    bool
+    default y if (SAMPLE_SUPPORT_SLE_MESH_SERVER || SAMPLE_SUPPORT_SLE_MESH)
+
+config SUPPORT_SLE_CENTRAL
+    bool
+    default y if (SAMPLE_SUPPORT_SLE_MESH_CLIENT || SAMPLE_SUPPORT_SLE_MESH)
+
+# BLE 网关需要 BLE 协议栈支持
+config SUPPORT_BLE
+    bool
+    default y if SAMPLE_SUPPORT_SLE_MESH
