@@ -65,9 +65,11 @@ extern "C" {
  *      !! 注意：同一网络中每个节点必须使用不同的地址，否则会引发路由混乱 !!
  *
  *    - 自动模式（默认）：MESH_NODE_ADDR = 0，运行时在 sle_uart_server_adv.c
- *      的 sle_uart_server_adv_init() 中从 SLE MAC 地址折叠推导出 16-bit 地址。
- *      折叠算法：addr = (mac[0]^mac[2]^mac[4]) | ((mac[1]^mac[3]^mac[5])<<8)
+ *      的 sle_uart_server_adv_init() 中从 EFUSE Die-ID 折叠推导出 16-bit 地址。
+ *      Die-ID 是芯片出厂时烧录的唯一标识，断电/重启后不变。
+ *      折叠算法：偶数下标字节 XOR → 低 8 位，奇数下标字节 XOR → 高 8 位
  *      存在极小概率的地址碰撞（约 1/65533），大规模部署时建议改用手动分配。
+ *      若 Die-ID 读取失败，会降级到 SLE MAC 折叠（地址可能随重启变化）。
  *
  *  保留地址：
  *    - 0x0000 (MESH_ADDR_UNASSIGNED) : 未分配 / 无效
@@ -82,7 +84,7 @@ extern "C" {
  * @brief 运行时节点地址（全局变量）
  *
  * 所有模块应统一使用此变量获取本节点地址，切勿直接使用 MESH_NODE_ADDR 宏。
- * 在自动模式下，该变量由 sle_uart_server_adv_init() 赋值；
+ * 在自动模式下，该变量由 sle_uart_server_adv_init() 基于 EFUSE Die-ID 赋值；
  * 在手动模式下，由 mesh_main.c 的 mesh_main_task() 初始化为 MESH_NODE_ADDR。
  */
 extern uint16_t g_mesh_node_addr;

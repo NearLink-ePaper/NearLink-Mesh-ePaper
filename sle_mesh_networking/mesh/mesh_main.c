@@ -144,7 +144,7 @@ uint16_t g_mesh_node_addr = 0;
  *   2) 非零 → 手动模式：直接赋值给 g_mesh_node_addr
  *   3) 零   → 自动模式：保持 g_mesh_node_addr = 0 (pending)，
  *      实际推导在 sle_uart_server_adv_init() 中完成
- *      (SLE enable 之后才能读取到真实 MAC 地址)
+ *      (基于 EFUSE Die-ID 折叠，断电重启后地址不变)
  *
  * @note 自动模式下地址折叠算法见 mesh_config.h 节点地址配置节。
  */
@@ -580,7 +580,6 @@ void mesh_gateway_inject(uint16_t dst_addr, const uint8_t *data, uint16_t len)
     }
 }
 
-/* ============================================================
 /* ===================================================================
  *  Section 11: UART 接收处理
  *

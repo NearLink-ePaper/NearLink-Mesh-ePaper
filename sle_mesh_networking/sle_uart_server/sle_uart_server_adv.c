@@ -39,6 +39,7 @@
 
 #if defined(CONFIG_SAMPLE_SUPPORT_SLE_MESH)
 #include "mesh_config.h"   /* g_mesh_node_addr, MESH_ADV_NAME_PREFIX, SLE_ADDR_INDEX */
+#include "efuse.h"         /* uapi_efuse_init, uapi_efuse_get_die_id */
 #endif
 
 /* ============================================================
@@ -360,7 +361,7 @@ errcode_t sle_uart_announce_register_cbks(void)
  *          或 mesh_main 断连后 → g_need_re_announce → adv_init()
  *
  *  Mesh 模式流程:
- *  1. 若 g_mesh_node_addr == 0（自动地址模式），从 SLE MAC 推导 16-bit 地址
+ *  1. 若 g_mesh_node_addr == 0（自动地址模式），从 EFUSE Die-ID 推导 16-bit 地址
  *  2. 将 mesh_addr 写入 g_local_addr[4..5]（小端序）
  *  3. 生成广播名 "sle_m_XXXX"
  *  4. 配置广播参数 → 配置广播数据 → 启动广播
@@ -370,18 +371,39 @@ errcode_t sle_uart_server_adv_init(void)
     errcode_t ret;
 
 #if defined(CONFIG_SAMPLE_SUPPORT_SLE_MESH)
-    /* 自动地址模式: g_mesh_node_addr == 0 表示需要从 MAC 推导.
-     * 此处 SLE 已 enable (由 enable_cbk 触发), 可以读到真实 MAC */
+    /* 自动地址模式: g_mesh_node_addr == 0 表示需要从芯片唯一标识推导.
+     * 使用 EFUSE Die-ID（出厂烧写, 每颗芯片唯一, 重启不变）而非 SLE MAC,
+     * 确保同一份固件烧录到不同板子 → 不同地址，且断电/reboot 后地址不变 */
     if (g_mesh_node_addr == 0) {
-        sle_addr_t real_addr = {0};
-        sle_get_local_addr(&real_addr);
-        uint8_t *mac = real_addr.addr;
+        uint8_t die_id[16] = {0};
+        uint16_t addr = 0;
 
-        /* 将 6 字节 MAC 折叠为 16-bit: XOR 高低字节
-         * WHY 用 XOR: 简单且零开销地将 48 位压缩到 16 位，
-         * 实际部署中放号板 MAC 差异足够大时冲突概率极低 */
-        uint16_t addr = ((uint16_t)mac[0] ^ mac[2] ^ mac[4]) |
-                        (((uint16_t)mac[1] ^ mac[3] ^ mac[5]) << 8);
+        /* 初始化 EFUSE 驱动（bootloader 已初始化, 此处为安全起见再调一次, 幂等操作） */
+        (void)uapi_efuse_init();
+        errcode_t efuse_ret = uapi_efuse_get_die_id(die_id, sizeof(die_id));
+
+        if (efuse_ret == ERRCODE_SUCC) {
+            /* 将 16 字节 Die-ID 折叠为 16-bit:
+             * 偶数下标字节 XOR → 低 8 位, 奇数下标字节 XOR → 高 8 位
+             * 16 字节参与折叠，冲突概率约 1/65533，满足小规模 Mesh 需求 */
+            uint8_t lo = 0, hi = 0;
+            for (uint8_t i = 0; i < 16; i += 2) {
+                lo ^= die_id[i];
+                hi ^= die_id[i + 1];
+            }
+            addr = (uint16_t)lo | ((uint16_t)hi << 8);
+            sample_at_log_print("%s addr from EFUSE Die-ID -> 0x%04X\r\n",
+                        SLE_UART_SERVER_LOG, addr);
+        } else {
+            /* Die-ID 读取失败 → 降级到 SLE MAC 方式（地址可能随重启变化） */
+            sample_at_log_print("%s die_id read fail: 0x%x, fallback to MAC\r\n",
+                        SLE_UART_SERVER_LOG, efuse_ret);
+            sle_addr_t real_addr = {0};
+            sle_get_local_addr(&real_addr);
+            uint8_t *mac = real_addr.addr;
+            addr = ((uint16_t)mac[0] ^ mac[2] ^ mac[4]) |
+                   (((uint16_t)mac[1] ^ mac[3] ^ mac[5]) << 8);
+        }
 
         /* 确保有效范围 0x0001 ~ 0xFFFD
          * WHY: 0x0000 = MESH_ADDR_UNASSIGNED, 0xFFFE/0xFFFF = 广播/保留地址 */
@@ -389,10 +411,8 @@ errcode_t sle_uart_server_adv_init(void)
         if (addr >= 0xFFFE) addr = 0xFFFD;
 
         g_mesh_node_addr = addr;
-        sample_at_log_print("%s auto addr from MAC: %02X:%02X:%02X:%02X:%02X:%02X -> 0x%04X\r\n",
-                    SLE_UART_SERVER_LOG,
-                    mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
-                    g_mesh_node_addr);
+        sample_at_log_print("%s mesh node addr = 0x%04X (persistent)\r\n",
+                    SLE_UART_SERVER_LOG, g_mesh_node_addr);
     }
 
     /* Mesh模式: 运行时填充 SLE 地址与广播名称
