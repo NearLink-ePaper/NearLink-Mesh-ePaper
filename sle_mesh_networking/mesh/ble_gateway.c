@@ -167,6 +167,12 @@ static struct {
     uint8_t  start_len;           /**< start_payload 的实际长度 */
     uint16_t fc_pkt_count;        /**< O4: Mesh FC 大包分包数 (负载为 IMG_FC_PKT_PAYLOAD，
                                        比 APP 原始包更大，减少包数提高传输效率) */
+    /* --- v3: 组播支持 --- */
+    uint8_t  is_multicast;        /**< 是否为组播传输: 0=单播, 1=组播 */
+    uint8_t  target_count;        /**< 组播目标节点数量 (1~MESH_MCAST_MAX_TARGETS) */
+    uint16_t target_addrs[MESH_MCAST_MAX_TARGETS]; /**< 组播目标地址列表 */
+    uint8_t  target_done[MESH_MCAST_MAX_TARGETS];  /**< 每个目标的完成状态: 0=待定, 1=OK, 2=CRC_ERR, 3=超时 */
+    uint8_t  completed_count;     /**< 已完成（包括成功和失败）的目标数 */
     uint8_t  buf[IMG_GW_CACHE_SIZE]; /**< 图片原始数据缓存区 */
 } g_img_cache = {0};
 
@@ -341,6 +347,9 @@ static struct {
 
     /* --- 进度统计 --- */
     uint16_t total_injected;    /**< 网关已注入 Mesh 的总包数 (含所有重传)，用于统计日志 */
+
+    /* --- v3: 组播支持 --- */
+    uint8_t  mcast_missing_received; /**< 组播模式：是否有目标发送了 MISSING 位图 */
 } g_fc = {0};
 
 /* =====================================================================
@@ -357,6 +366,49 @@ static void uuid16_to_bt_uuid(uint16_t uuid16, bt_uuid_t *out)
     out->uuid_len = UART16_LEN;
     out->uuid[0] = (uint8_t)(uuid16 >> 8);
     out->uuid[1] = (uint8_t)(uuid16);
+}
+
+/**
+ * @brief  判断指定地址是否为当前组播目标之一
+ * @param  addr  待检查的 Mesh 地址
+ * @return true=该地址在组播目标列表中, false=不在
+ */
+static bool is_mcast_target(uint16_t addr)
+{
+    if (!g_img_cache.is_multicast) return false;
+    for (uint8_t i = 0; i < g_img_cache.target_count; i++) {
+        if (g_img_cache.target_addrs[i] == addr) return true;
+    }
+    return false;
+}
+
+/**
+ * @brief  向手机 APP 发送组播进度通知
+ * @note   BLE 帧格式: AA 8A COMPLETED(1) TOTAL_TARGETS(1) LATEST_ADDR(2) LATEST_STATUS(1)
+ *         APP 据此显示 "X/Y 节点已完成"
+ */
+static void mcast_notify_progress(uint16_t latest_addr, uint8_t latest_status)
+{
+    if (!g_gw_connected || g_gw_notify_handle == 0) return;
+
+    uint8_t frame[7];
+    frame[0] = 0xAA;
+    frame[1] = 0x8A;  /* CMD_IMG_MCAST_PROGRESS */
+    frame[2] = g_img_cache.completed_count;
+    frame[3] = g_img_cache.target_count;
+    frame[4] = (latest_addr >> 8) & 0xFF;
+    frame[5] = latest_addr & 0xFF;
+    frame[6] = latest_status;
+
+    gatts_ntf_ind_t param = { 0 };
+    param.attr_handle = g_gw_notify_handle;
+    param.value_len = sizeof(frame);
+    param.value = frame;
+    gatts_notify_indicate(g_gw_server_id, g_gw_conn_id, &param);
+
+    osal_printk("%s MCAST progress: %d/%d done, latest=0x%04X status=%d\r\n",
+                BLE_GW_LOG, g_img_cache.completed_count, g_img_cache.target_count,
+                latest_addr, latest_status);
 }
 
 /* =====================================================================
@@ -707,7 +759,12 @@ static void fc_inject_data_pkt(uint16_t seq)
     (void)memcpy_s(&mesh_buf[5], sizeof(mesh_buf) - 5,
                    &g_img_cache.buf[offset], pkt_len);
 
-    mesh_gateway_inject(g_img_cache.dst_addr, mesh_buf, 5 + pkt_len);
+    /* v3: 组播模式使用广播发送，单播使用定向注入 */
+    if (g_img_cache.is_multicast) {
+        mesh_broadcast(mesh_buf, 5 + pkt_len);
+    } else {
+        mesh_gateway_inject(g_img_cache.dst_addr, mesh_buf, 5 + pkt_len);
+    }
     g_fc.total_injected++;
 }
 
@@ -721,11 +778,16 @@ static void fc_send_checkpoint(void)
     uint8_t mesh_buf[2];
     mesh_buf[0] = 0x08;  /* IMG_CMD_CHECKPOINT: 节点收到后回复已接收包数 */
     mesh_buf[1] = g_fc.seg_id;
-    mesh_gateway_inject(g_img_cache.dst_addr, mesh_buf, 2);
+    /* v3: 组播模式广播 CHECKPOINT，单播定向发送 */
+    if (g_img_cache.is_multicast) {
+        mesh_broadcast(mesh_buf, 2);
+    } else {
+        mesh_gateway_inject(g_img_cache.dst_addr, mesh_buf, 2);
+    }
     g_fc.chkpt_send_tick = osal_get_tick_ms();  /* 记录发送时刻，用于计算 RTT 样本 */
-    osal_printk("%s FC CHKPT seg=%d sent (W=%d D=%d TO=%d)\r\n",
+    osal_printk("%s FC CHKPT seg=%d sent (W=%d D=%d TO=%d)%s\r\n",
                 BLE_GW_LOG, g_fc.seg_id, g_fc.window, g_fc.delay_ms,
-                g_fc.chkpt_timeout);
+                g_fc.chkpt_timeout, g_img_cache.is_multicast ? " [MCAST]" : "");
 }
 
 /**
@@ -739,8 +801,14 @@ static void fc_send_end(void)
     mesh_buf[0] = 0x06;  /* IMG_CMD_END: 图片传输结束命令 */
     mesh_buf[1] = (g_img_cache.crc16 >> 8) & 0xFF;
     mesh_buf[2] = g_img_cache.crc16 & 0xFF;
-    mesh_gateway_inject(g_img_cache.dst_addr, mesh_buf, 3);
-    osal_printk("%s FC END sent crc=0x%04X\r\n", BLE_GW_LOG, g_img_cache.crc16);
+    /* v3: 组播模式广播 END，单播定向发送 */
+    if (g_img_cache.is_multicast) {
+        mesh_broadcast(mesh_buf, 3);
+    } else {
+        mesh_gateway_inject(g_img_cache.dst_addr, mesh_buf, 3);
+    }
+    osal_printk("%s FC END sent crc=0x%04X%s\r\n", BLE_GW_LOG, g_img_cache.crc16,
+                g_img_cache.is_multicast ? " [MCAST]" : "");
 }
 
 /**
@@ -767,6 +835,8 @@ static void fc_stop_turbo(void)
 static void fc_notify_progress(uint8_t phase, uint16_t rx_count)
 {
     if (!g_gw_connected || g_gw_notify_handle == 0) return;
+    /* v3: 组播模式不发送逐包进度 (0x89)，改用 0x8A 节点完成进度 */
+    if (g_img_cache.is_multicast) return;
 
     uint8_t frame[9];
     frame[0] = 0xAA;
@@ -884,12 +954,27 @@ static void fc_start(void)
 {
     (void)memset_s(&g_fc, sizeof(g_fc), 0, sizeof(g_fc));
 
-    /* ---- P0: 根据目标节点跳数自适应初始参数 ---- */
-    uint8_t hops = mesh_route_get_hop_count(g_img_cache.dst_addr);
+    /* ---- v3: 组播模式使用保守参数 (广播到多节点，无法精确测跳数) ---- */
+    uint8_t hops;
     uint16_t w_init;
     uint16_t d_init;
     uint16_t ss_init;
     uint16_t chkpt_to;
+
+    if (g_img_cache.is_multicast) {
+        /* 组播: 使用保守的 2 跳等效参数。
+         * 由于数据通过广播发送到多个目标，无法针对单个目标优化，
+         * 使用适中的窗口和延时确保大多数节点能可靠接收。 */
+        hops = 2;
+        w_init = 12;
+        d_init = 12;
+        ss_init = 20;
+        chkpt_to = FC_CHKPT_TIMEOUT_3HOP;
+        osal_printk("%s FC MCAST mode: %d targets, using conservative params\r\n",
+                    BLE_GW_LOG, g_img_cache.target_count);
+    } else {
+    /* ---- P0: 根据目标节点跳数自适应初始参数 (单播) ---- */
+    hops = mesh_route_get_hop_count(g_img_cache.dst_addr);
 
     /* F13: 自发自收检测 —— 目标地址等于本节点，直接本地处理 */
     uint16_t my_addr = mesh_get_my_addr();
@@ -939,6 +1024,7 @@ static void fc_start(void)
         w_init = 10;  d_init = 10;  ss_init = 20;
         chkpt_to = FC_CHKPT_TIMEOUT_DEF;
     }
+    } /* end of: if (g_img_cache.is_multicast) ... else { ... } */
 
     /* O6+F16: 根据跳数动态设置 START 延时
      * 多跳场景需要更长时间让 Turbo 连接间隔变更传播到所有中继节点
@@ -1209,21 +1295,68 @@ void ble_gateway_img_tick(void)
 
     /* ── 等待 RESULT(0x86) 或 MISSING(0x87): 目标节点验证后回复结果 ── */
     case FC_WAIT_RESULT:
-        if (now - g_fc.state_tick >= FC_RESULT_TIMEOUT_MS) {
-            osal_printk("%s FC RESULT timeout, resend END\r\n", BLE_GW_LOG);
-            /* 超时: 重发 END，最多重试 IMG_GW_MAX_RETRY 次后放弃 */
-            g_fc.retry_round++;
-            if (g_fc.retry_round > IMG_GW_MAX_RETRY) {
-                osal_printk("%s FC give up after %d rounds\r\n",
-                            BLE_GW_LOG, g_fc.retry_round);
-                g_fc.state = FC_IDLE;
-                g_mesh_log_suppress = false;
-                sle_uart_resume_scan();  /* P5: 传输结束，恢复 SLE 扫描 */
-                fc_stop_turbo();         /* O2: 恢复正常连接间隔 */
-                g_img_cache.active = 0;
-            } else {
-                g_fc.state = FC_SEND_END;
-                g_fc.state_tick = now;
+        if (g_img_cache.is_multicast) {
+            /* ── v3: 组播模式 WAIT_RESULT ──
+             * 等待所有目标节点回复，收集 RESULT 和 MISSING。
+             * 由 ble_gateway_send_image_response() 异步处理每个响应。
+             * 此处仅做超时检测和状态迁移。 */
+            if (g_img_cache.completed_count >= g_img_cache.target_count) {
+                /* 所有目标已完成（在 send_image_response 中已处理清理）*/
+                break;
+            }
+            if (now - g_fc.state_tick >= FC_RESULT_TIMEOUT_MS) {
+                if (g_fc.mcast_missing_received && g_fc.miss_count > 0) {
+                    /* 有目标报告缺包 → 补包 */
+                    osal_printk("%s FC MCAST: retransmit %d missing pkts\r\n",
+                                BLE_GW_LOG, g_fc.miss_count);
+                    g_fc.mcast_missing_received = 0;
+                    g_fc.state = FC_RETRANSMIT;
+                    g_fc.retx_sent = 0;
+                    g_fc.miss_scan_pos = 0;
+                    g_fc.last_pkt_tick = now;
+                } else {
+                    /* 超时：重发 END 或放弃 */
+                    g_fc.retry_round++;
+                    osal_printk("%s FC MCAST RESULT timeout, round=%d (%d/%d done)\r\n",
+                                BLE_GW_LOG, g_fc.retry_round,
+                                g_img_cache.completed_count, g_img_cache.target_count);
+                    if (g_fc.retry_round > IMG_GW_MAX_RETRY) {
+                        /* 放弃：将未完成的目标标记为超时 */
+                        for (uint8_t i = 0; i < g_img_cache.target_count; i++) {
+                            if (g_img_cache.target_done[i] == 0) {
+                                g_img_cache.target_done[i] = 3; /* 超时 */
+                                g_img_cache.completed_count++;
+                                mcast_notify_progress(g_img_cache.target_addrs[i], 0x02);
+                            }
+                        }
+                        g_fc.state = FC_IDLE;
+                        g_mesh_log_suppress = false;
+                        sle_uart_resume_scan();
+                        fc_stop_turbo();
+                        g_img_cache.active = 0;
+                    } else {
+                        g_fc.state = FC_SEND_END;
+                        g_fc.state_tick = now;
+                    }
+                }
+            }
+        } else {
+            /* ── 单播模式 WAIT_RESULT (原有逻辑) ── */
+            if (now - g_fc.state_tick >= FC_RESULT_TIMEOUT_MS) {
+                osal_printk("%s FC RESULT timeout, resend END\r\n", BLE_GW_LOG);
+                g_fc.retry_round++;
+                if (g_fc.retry_round > IMG_GW_MAX_RETRY) {
+                    osal_printk("%s FC give up after %d rounds\r\n",
+                                BLE_GW_LOG, g_fc.retry_round);
+                    g_fc.state = FC_IDLE;
+                    g_mesh_log_suppress = false;
+                    sle_uart_resume_scan();
+                    fc_stop_turbo();
+                    g_img_cache.active = 0;
+                } else {
+                    g_fc.state = FC_SEND_END;
+                    g_fc.state_tick = now;
+                }
             }
         }
         break;
@@ -1398,6 +1531,90 @@ int ble_gateway_send_image_response(uint16_t src_addr, const uint8_t *data, uint
 
     uint8_t cmd = data[0];
 
+    /* ═══════════════════════════════════════════════════
+     *  v3: 组播模式下的上行消息处理
+     *  组播使用独立的响应路由逻辑：
+     *  - CHKPT_ACK: 接受任意目标节点的首个 ACK 驱动 FC
+     *  - MISSING: OR 合并所有目标的缺包位图
+     *  - RESULT: 逐节点跟踪完成状态，通过 0x8A 通知 APP
+     * ═══════════════════════════════════════════════════ */
+    if (g_img_cache.is_multicast && g_img_cache.active) {
+
+        /* ── 0x88 CHECKPOINT_ACK: 接受任意目标节点的 ACK (首个驱动 FC) ── */
+        if (cmd == 0x88 && is_mcast_target(src_addr)) {
+            fc_on_checkpoint_ack(data, len);
+            return 0;
+        }
+
+        /* ── 0x87 MISSING: OR 合并所有目标的缺包位图 ── */
+        if (cmd == 0x87 && is_mcast_target(src_addr)) {
+            if (len >= 3 + IMG_GW_BITMAP_BYTES) {
+                /* 首次收到 MISSING 时清零位图，后续 OR 合并 */
+                if (!g_fc.mcast_missing_received) {
+                    (void)memset_s(g_fc.miss_bitmap, IMG_GW_BITMAP_BYTES, 0, IMG_GW_BITMAP_BYTES);
+                }
+                /* OR 合并: 将此目标的缺包位图并入全局位图 */
+                for (uint8_t i = 0; i < IMG_GW_BITMAP_BYTES; i++) {
+                    g_fc.miss_bitmap[i] |= data[3 + i];
+                }
+                g_fc.mcast_missing_received = 1;
+                /* 重新计算合并后的缺包总数 */
+                uint16_t total_miss = 0;
+                for (uint8_t i = 0; i < IMG_GW_BITMAP_BYTES; i++) {
+                    uint8_t b = g_fc.miss_bitmap[i];
+                    while (b) { total_miss += (b & 1); b >>= 1; }
+                }
+                g_fc.miss_count = total_miss;
+                osal_printk("%s MCAST MISSING from 0x%04X, merged total=%d\r\n",
+                            BLE_GW_LOG, src_addr, total_miss);
+            }
+            return 0;  /* 不转发给 APP */
+        }
+
+        /* ── 0x85 ACK: 组播模式下忽略逐包 ACK ── */
+        if (cmd == 0x85 && is_mcast_target(src_addr)) {
+            return 0;
+        }
+
+        /* ── 0x86 RESULT: 逐节点跟踪完成状态 ── */
+        if (cmd == 0x86 && is_mcast_target(src_addr)) {
+            uint8_t status = (len >= 2) ? data[1] : 0xFF;
+            /* 查找目标并标记完成（去重：已标记的不再重复计数） */
+            for (uint8_t i = 0; i < g_img_cache.target_count; i++) {
+                if (g_img_cache.target_addrs[i] == src_addr &&
+                    g_img_cache.target_done[i] == 0) {
+                    g_img_cache.target_done[i] = (status == 0x00) ? 1 : 2;
+                    g_img_cache.completed_count++;
+                    osal_printk("%s MCAST RESULT from 0x%04X: status=%d (%d/%d done)\r\n",
+                                BLE_GW_LOG, src_addr, status,
+                                g_img_cache.completed_count, g_img_cache.target_count);
+                    /* 通知 APP 组播进度 */
+                    mcast_notify_progress(src_addr, status);
+                    break;
+                }
+            }
+            /* 如果全部目标完成 → 停止 FC，清理状态 */
+            if (g_img_cache.completed_count >= g_img_cache.target_count) {
+                osal_printk("%s MCAST ALL DONE: %d/%d targets completed\r\n",
+                            BLE_GW_LOG, g_img_cache.completed_count, g_img_cache.target_count);
+                if (g_fc.state != FC_IDLE) {
+                    g_fc.state = FC_IDLE;
+                    g_mesh_log_suppress = false;
+                    sle_uart_resume_scan();
+                    fc_stop_turbo();
+                }
+                g_img_cache.active = 0;
+            }
+            return 0;  /* 不转发原始 RESULT，使用 0x8A 进度帧替代 */
+        }
+
+        return 0;  /* 组播模式下其他命令静默忽略 */
+    }
+
+    /* ═══════════════════════════════════════════════════
+     *  单播模式下的上行消息处理 (原有逻辑)
+     * ═══════════════════════════════════════════════════ */
+
     /* ── 0x88 CHECKPOINT_ACK: 流控处理 ── */
     if (cmd == 0x88 && g_img_cache.active &&
         src_addr == g_img_cache.dst_addr) {
@@ -1536,6 +1753,108 @@ static void gw_write_req_cbk(uint8_t server_id, uint16_t conn_id,
     /* 拓扑查询命令 (0x03) */
     if (cmd == 0x03) {
         gw_handle_topology_query();
+
+    } else if (cmd == 0x0A) {
+        /* ═══════════════════════════════════════════════════
+         *  v3: 组播图片传输开始命令 (CMD_IMG_MCAST_START = 0x0A)
+         *
+         *  BLE 帧格式:
+         *    AA 0A N(1) ADDR1(2)...ADDRn(2) TOTAL(2) PKT(2) W(2) H(2) MODE(1) [XFER(1)]
+         *
+         *  处理流程:
+         *    1. 解析 N 和目标地址列表
+         *    2. 初始化 g_img_cache + 组播字段
+         *    3. 构造 Mesh MCAST_START 帧 (含目标列表) 并广播
+         *    4. APP 随后继续发 IMG_DATA (0x05) + IMG_END (0x06)，格式不变
+         * ═══════════════════════════════════════════════════ */
+        if (write_cb->length < 5) return;  /* 至少: AA(1)+CMD(1)+N(1)+ADDR(2) */
+
+        uint8_t n_targets = write_cb->value[2];
+        if (n_targets == 0 || n_targets > MESH_MCAST_MAX_TARGETS) {
+            osal_printk("%s MCAST: invalid target count %d\r\n", BLE_GW_LOG, n_targets);
+            return;
+        }
+
+        /* 解析目标地址列表 */
+        uint16_t addr_end = 3 + 2 * (uint16_t)n_targets;
+        if (write_cb->length < addr_end + 9) {
+            osal_printk("%s MCAST: frame too short %d (need %d)\r\n",
+                        BLE_GW_LOG, write_cb->length, addr_end + 9);
+            return;
+        }
+
+        /* 初始化缓存 */
+        (void)memset_s(&g_img_cache, sizeof(g_img_cache), 0, sizeof(g_img_cache));
+        g_img_cache.is_multicast = 1;
+        g_img_cache.target_count = n_targets;
+        g_img_cache.dst_addr = MESH_ADDR_BROADCAST; /* 组播使用广播地址 */
+        g_img_cache.completed_count = 0;
+
+        for (uint8_t i = 0; i < n_targets; i++) {
+            g_img_cache.target_addrs[i] = ((uint16_t)write_cb->value[3 + 2 * i] << 8)
+                                         | write_cb->value[4 + 2 * i];
+            g_img_cache.target_done[i] = 0;
+            osal_printk("%s MCAST target[%d] = 0x%04X\r\n",
+                        BLE_GW_LOG, i, g_img_cache.target_addrs[i]);
+        }
+
+        /* 解析图片元信息 (偏移 = 3 + 2*N) */
+        uint16_t off = addr_end;
+        g_img_cache.total_bytes = ((uint16_t)write_cb->value[off] << 8) | write_cb->value[off + 1];
+        g_img_cache.pkt_count   = ((uint16_t)write_cb->value[off + 2] << 8) | write_cb->value[off + 3];
+        g_img_cache.fc_pkt_count = (g_img_cache.total_bytes + IMG_FC_PKT_PAYLOAD - 1) / IMG_FC_PKT_PAYLOAD;
+
+        g_img_cache.xfer_mode = 0;  /* 组播固定使用 FAST 模式 */
+        g_img_cache.active = 1;
+        g_fc.state = FC_IDLE;
+        g_mesh_log_suppress = false;
+        sle_uart_resume_scan();
+
+        osal_printk("%s MCAST START: %d targets, total=%dB pkts=%d→%d\r\n",
+                    BLE_GW_LOG, n_targets, g_img_cache.total_bytes,
+                    g_img_cache.pkt_count, g_img_cache.fc_pkt_count);
+
+        /* 构造 Mesh MCAST_START 帧并广播:
+         * [0x0A, N, ADDR1(2)...ADDRn(2), TOTAL(2), PKT(2), W(2), H(2), MODE, XFER]
+         * PKT 用 FC 大包数覆盖 (与单播 START 一致) */
+        uint8_t mesh_buf[250];
+        uint16_t mpos = 0;
+        mesh_buf[mpos++] = 0x0A;  /* IMG_CMD_MCAST_START */
+        mesh_buf[mpos++] = n_targets;
+        for (uint8_t i = 0; i < n_targets; i++) {
+            mesh_buf[mpos++] = (g_img_cache.target_addrs[i] >> 8) & 0xFF;
+            mesh_buf[mpos++] = g_img_cache.target_addrs[i] & 0xFF;
+        }
+        /* 复制图片元信息 (TOTAL, PKT, W, H, MODE, [XFER]) */
+        uint16_t meta_len = write_cb->length - addr_end;
+        if (meta_len > sizeof(mesh_buf) - mpos) meta_len = sizeof(mesh_buf) - mpos;
+        (void)memcpy_s(&mesh_buf[mpos], sizeof(mesh_buf) - mpos,
+                       &write_cb->value[addr_end], meta_len);
+        /* 覆盖 PKT 为 FC 大包数 */
+        mesh_buf[mpos + 2] = (g_img_cache.fc_pkt_count >> 8) & 0xFF;
+        mesh_buf[mpos + 3] = g_img_cache.fc_pkt_count & 0xFF;
+        /* 强制 FAST 模式 (组播不支持 ACK 模式) */
+        if (meta_len >= 10) {
+            mesh_buf[mpos + 9] = 0x00;  /* IMG_XFER_FAST */
+        }
+        mpos += meta_len;
+
+        /* 广播到全网，所有目标节点将检查自己是否在列表中 */
+        mesh_broadcast(mesh_buf, mpos);
+
+        /* 网关自身若在目标列表中，直接标记完成 (网关既是发送方也是接收方，
+         * 数据已在 g_img_cache.buf 中，无需等待自己给自己发 RESULT) */
+        for (uint8_t i = 0; i < n_targets; i++) {
+            if (g_img_cache.target_addrs[i] == g_mesh_node_addr) {
+                g_img_cache.target_done[i] = 1;  /* 成功 */
+                g_img_cache.completed_count++;
+                osal_printk("%s MCAST: gateway self 0x%04X auto-done (%d/%d)\r\n",
+                            BLE_GW_LOG, g_mesh_node_addr,
+                            g_img_cache.completed_count, g_img_cache.target_count);
+                mcast_notify_progress(g_mesh_node_addr, 0x00);
+                break;
+            }
+        }
 
     } else if (cmd >= 0x04 && cmd <= 0x07) {
         /* ── 图片传输命令 (0x04-0x07) ── */

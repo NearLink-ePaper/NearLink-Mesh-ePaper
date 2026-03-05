@@ -68,6 +68,7 @@ extern "C" {
 #define IMG_CMD_END             0x06    /**< 传输结束：携带 CRC16 校验值，触发缺包检查 */
 #define IMG_CMD_CANCEL          0x07    /**< 取消传输：源端主动终止本次图传 */
 #define IMG_CMD_CHECKPOINT      0x08    /**< 分段检查点（v2）：网关分段发完后查询接收进度 */
+#define IMG_CMD_MCAST_START     0x0A    /**< 组播开始（v3）：携带目标节点列表 + 图片元信息 */
 
 /* —— 上行命令（接收节点 → 网关） —— */
 #define IMG_CMD_ACK             0x85    /**< 单包确认（ACK 模式下使用） */

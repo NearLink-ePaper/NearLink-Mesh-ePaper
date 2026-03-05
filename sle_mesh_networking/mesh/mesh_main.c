@@ -497,8 +497,8 @@ static void mesh_app_data_received(uint16_t src_addr, const uint8_t *data, uint1
         return;  /* 控制帧不转发给用户层 */
     }
 
-    /* ---- 图片传输命令 (0x04~0x08) → image_receiver 模块处理 ---- */
-    if (len >= 1 && data[0] >= 0x04 && data[0] <= 0x08) {
+    /* ---- 图片传输命令 (0x04~0x08, 0x0A) → image_receiver 模块处理 ---- */
+    if (len >= 1 && ((data[0] >= 0x04 && data[0] <= 0x08) || data[0] == 0x0A)) {
         if (image_receiver_on_data(src_addr, data, len)) {
             return;  /* 图片命令已处理，不转发给手机/用户回调 */
         }

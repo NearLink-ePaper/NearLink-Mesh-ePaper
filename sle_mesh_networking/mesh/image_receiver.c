@@ -61,6 +61,13 @@
 static uint8_t s_img_buf[IMG_RX_BUF_SIZE];  /**< 图片数据缓冲区 */
 static img_rx_info_t s_info;                /**< 接收会话上下文 */
 
+/* === 组播目标列表 =========================================================
+ *  当接收到组播 START (0x0A) 时，目标列表记录在此处。
+ *  节点先检查自己的地址是否在列表中，若是则接受传输，否则忽略。
+ * ====================================================================== */
+static uint16_t s_mcast_targets[MESH_MCAST_MAX_TARGETS]; /**< 组播目标地址列表 */
+static uint8_t  s_mcast_count = 0;           /**< 当前组播目标数量，0=非组播/单播 */
+
 /* === 外部依赖 ============================================================
  *  mesh_send() 由 mesh 组网模块提供，用于向指定 mesh 地址发送原始数据。
  *  此处使用 extern 前向声明而非头文件引入，因为 mesh 模块头文件可能
@@ -450,8 +457,107 @@ static void handle_cancel(uint16_t src_addr, const uint8_t *data, uint16_t len)
     }
 
     s_info.state = IMG_STATE_IDLE;
+    s_mcast_count = 0;  /* 取消时清除组播状态 */
     (void)data;
     (void)len;
+}
+
+/**
+ * @brief  处理 IMG_CMD_MCAST_START (0x0A) —— 组播开始传输命令（v3 新增）
+ * @param  src_addr  发送方 mesh 地址（网关）
+ * @param  data      完整报文：[0x0A, N, ADDR1_HI, ADDR1_LO, ..., TOTAL(2), PKT(2), W(2), H(2), MODE, XFER]
+ * @param  len       报文长度
+ *
+ * @note   处理流程：
+ *         1. 解析 N（目标节点数量）和目标地址列表；
+ *         2. 检查本节点是否在目标列表中，不在则忽略本次传输；
+ *         3. 若在列表中，按照与普通 START 相同的流程初始化接收缓冲区；
+ *         4. 将目标列表保存到 s_mcast_targets 供后续使用。
+ *
+ *         帧格式（Mesh 负载）：
+ *         [0x0A] [N(1)] [ADDR1_HI ADDR1_LO] ... [ADDRn_HI ADDRn_LO]
+ *         [TOTAL_HI TOTAL_LO] [PKT_HI PKT_LO] [W_HI W_LO] [H_HI H_LO] [MODE] [XFER]
+ */
+static void handle_mcast_start(uint16_t src_addr, const uint8_t *data, uint16_t len)
+{
+    if (len < 3) {
+        osal_printk("%s MCAST_START: too short %d\r\n", IMG_LOG, len);
+        return;
+    }
+
+    uint8_t n_targets = data[1];
+    if (n_targets == 0 || n_targets > MESH_MCAST_MAX_TARGETS) {
+        osal_printk("%s MCAST_START: invalid target count %d\r\n", IMG_LOG, n_targets);
+        return;
+    }
+
+    /* 最小长度: 1(cmd) + 1(N) + 2*N(addrs) + 9(TOTAL+PKT+W+H+MODE) = 11 + 2*N */
+    uint16_t min_len = 2 + 2 * (uint16_t)n_targets + 9;
+    if (len < min_len) {
+        osal_printk("%s MCAST_START: too short %d (need %d for %d targets)\r\n",
+                    IMG_LOG, len, min_len, n_targets);
+        return;
+    }
+
+    /* 解析目标地址列表，检查本节点是否在列表中 */
+    uint16_t my_addr = g_mesh_node_addr;
+    bool is_target = false;
+    s_mcast_count = n_targets;
+
+    for (uint8_t i = 0; i < n_targets; i++) {
+        uint16_t addr = ((uint16_t)data[2 + 2 * i] << 8) | data[3 + 2 * i];
+        s_mcast_targets[i] = addr;
+        if (addr == my_addr) {
+            is_target = true;
+        }
+    }
+
+    osal_printk("%s MCAST_START: %d targets, my_addr=0x%04X, is_target=%d\r\n",
+                IMG_LOG, n_targets, my_addr, is_target);
+
+    if (!is_target) {
+        osal_printk("%s MCAST_START: not a target, ignoring\r\n", IMG_LOG);
+        s_mcast_count = 0;
+        return;
+    }
+
+    /* 本节点是组播目标 → 解析图片元信息（偏移 = 2 + 2*N） */
+    uint16_t off = 2 + 2 * (uint16_t)n_targets;
+    uint16_t total  = ((uint16_t)data[off]     << 8) | data[off + 1];
+    uint16_t pkt    = ((uint16_t)data[off + 2] << 8) | data[off + 3];
+    uint16_t width  = ((uint16_t)data[off + 4] << 8) | data[off + 5];
+    uint16_t height = ((uint16_t)data[off + 6] << 8) | data[off + 7];
+    uint8_t  mode   = data[off + 8];
+    uint8_t  xfer   = (len > off + 9) ? data[off + 9] : IMG_XFER_FAST;
+
+    osal_printk("%s MCAST accepted: %dx%d total=%dB pkt=%d mode=%d xfer=%s from gw=0x%04X\r\n",
+                IMG_LOG, width, height, total, pkt, mode,
+                (xfer == IMG_XFER_ACK) ? "ACK" : "FAST", src_addr);
+
+    if (total > IMG_RX_BUF_SIZE) {
+        osal_printk("%s MCAST_START: total %d > buf %d, OOM\r\n", IMG_LOG, total, IMG_RX_BUF_SIZE);
+        send_result(src_addr, IMG_RESULT_OOM);
+        return;
+    }
+
+    /* 初始化接收上下文（与普通 START 完全相同） */
+    (void)memset_s(&s_info, sizeof(s_info), 0, sizeof(s_info));
+    (void)memset_s(s_img_buf, sizeof(s_img_buf), 0, total);
+    BITMAP_CLR_ALL(s_info.rx_bitmap, IMG_BITMAP_BYTES);
+
+    s_info.state       = IMG_STATE_RECEIVING;
+    s_info.width       = width;
+    s_info.height      = height;
+    s_info.mode        = mode;
+    s_info.xfer_mode   = xfer;
+    s_info.total_bytes = total;
+    s_info.pkt_count   = pkt;
+    s_info.rx_count    = 0;
+    s_info.expect_seq  = 0;
+    s_info.gw_addr     = src_addr;
+    s_info.start_tick  = osal_get_tick_ms();
+    s_info.retry_round = 0;
+    s_info.last_missing_cnt = pkt;
 }
 
 /* === 公共接口 ============================================================
@@ -499,6 +605,9 @@ bool image_receiver_on_data(uint16_t src_addr, const uint8_t *data, uint16_t len
             return true;
         case IMG_CMD_CHECKPOINT:
             handle_checkpoint(src_addr, data, len);
+            return true;
+        case IMG_CMD_MCAST_START:
+            handle_mcast_start(src_addr, data, len);
             return true;
         default:
             return false;
@@ -575,5 +684,6 @@ void image_receiver_reset(void)
     s_info.state = IMG_STATE_IDLE;
     s_info.rx_count = 0;
     s_info.result_retries = 0;
+    s_mcast_count = 0;
     osal_printk("%s reset → IDLE\r\n", IMG_LOG);
 }
