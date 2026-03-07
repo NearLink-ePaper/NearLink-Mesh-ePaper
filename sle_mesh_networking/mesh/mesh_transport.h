@@ -539,6 +539,16 @@ uint8_t mesh_transport_cleanup_stale(void);
  */
 void mesh_transport_set_turbo_mode(bool enable);
 
+/**
+ * @brief  O13: 查询 SLE 链路是否处于拥塞状态
+ *
+ * @return true   至少有一条连接处于 FLOWCTRL 或 BUSY 状态
+ * @return false  所有连接空闲, 可正常发送
+ *
+ * @note   基于 SLE QoS 流控回调实时更新, 可在 FC 引擎中用于拥塞感知发送节奏
+ */
+bool mesh_transport_is_sle_busy(void);
+
 #ifdef __cplusplus
 #if __cplusplus
 }

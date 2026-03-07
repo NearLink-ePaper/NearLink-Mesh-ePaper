@@ -37,10 +37,12 @@
  *  网关可能因 mesh 丢包未收到最终 RESULT，因此在 DONE/ERROR 状态下
  *  周期性重发若干次以提高可靠性。
  * ====================================================================== */
-/** RESULT 最大重发次数。取值范围：1~10，建议 3 */
+/** F28: RESULT 最大重发次数。3次已足够 (F27 保证网关只转发首条给手机)
+ *  额外重试仅用于覆盖偶发丢包, 不需过多 */
 #define IMG_RESULT_RETRY_COUNT  3
-/** RESULT 重发间隔（毫秒）。取值范围：200~2000 */
-#define IMG_RESULT_RETRY_MS     500
+/** F28: RESULT 重发间隔（毫秒）。1s 间隔 × 3次 = 3s 覆盖窗口
+ *  配合网关侧 FC_WAIT_RESULT 超时 (5s), 足以完成交互 */
+#define IMG_RESULT_RETRY_MS     1000
 
 /* === 位图辅助宏 ==========================================================
  *  使用 1-bit-per-seq 的紧凑位图跟踪每个分包是否到达。
@@ -537,6 +539,18 @@ static void handle_mcast_start(uint16_t src_addr, const uint8_t *data, uint16_t 
     if (total > IMG_RX_BUF_SIZE) {
         osal_printk("%s MCAST_START: total %d > buf %d, OOM\r\n", IMG_LOG, total, IMG_RX_BUF_SIZE);
         send_result(src_addr, IMG_RESULT_OOM);
+        return;
+    }
+
+    /* F26: 防止重复 MCAST_START 广播清空已接收数据
+     * 组播 START 通过 mesh_broadcast 发送，可能经多条路径到达同一节点，
+     * 导致同一 START 被 handle 两次。若已在接收同一传输，则跳过重初始化。
+     * 注: F23 重试时节点通常已进入 DONE/ERROR 状态，不会命中此检查。 */
+    if (s_info.state == IMG_STATE_RECEIVING &&
+        s_info.gw_addr == src_addr &&
+        s_info.total_bytes == total) {
+        osal_printk("%s MCAST_START: dup (already receiving from 0x%04X), ignored\r\n",
+                    IMG_LOG, src_addr);
         return;
     }
 

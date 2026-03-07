@@ -25,6 +25,7 @@
 #include "sle_connection_manager.h"
 #include "sle_ssap_server.h"
 #include "sle_ssap_client.h"
+#include "sle_transmition_manager.h"  /* O13: QoS flow control callback */
 
 #include "mesh_types.h"
 #include "mesh_config.h"
@@ -36,6 +37,9 @@
  * ============================================================ */
 static mesh_conn_pool_t g_conn_pool = { 0 };               /**< 全局连接池实例，存储所有活跃连接条目 */
 static mesh_transport_rx_callback_t g_rx_callback = NULL;   /**< 数据接收回调函数指针，由上层注册 */
+
+/* O13: SLE QoS flow-control state — 由 SLE 协议栈回调更新 */
+static volatile uint8_t g_sle_qos_busy = 0;  /**< >0 时表示有连接处于 FLOWCTRL/BUSY */
 
 /*
  * 外部函数声明: 由 sle_uart_server.c 提供
@@ -55,6 +59,22 @@ extern uint16_t sle_uart_server_get_property_handle(void);
 extern ssapc_write_param_t *get_g_sle_uart_send_param(void);
 
 /* ============================================================
+ *  O13: SLE QoS 流控回调 — 链路忙闲状态通知
+ * ============================================================ */
+static void sle_qos_callback(uint16_t conn_id, sle_link_qos_state_t link_state)
+{
+    if (link_state == SLE_QOS_IDLE) {
+        if (g_sle_qos_busy > 0) {
+            g_sle_qos_busy--;
+        }
+    } else {
+        g_sle_qos_busy++;
+        osal_printk("%s QoS: conn_id=%d state=%d (busy=%d)\r\n",
+                    MESH_LOG_TAG, conn_id, link_state, g_sle_qos_busy);
+    }
+}
+
+/* ============================================================
  *  初始化 / 反初始化
  * ============================================================ */
 
@@ -63,7 +83,14 @@ errcode_t mesh_transport_init(void)
 {
     (void)memset_s(&g_conn_pool, sizeof(g_conn_pool), 0, sizeof(g_conn_pool));
     g_rx_callback = NULL;
-    osal_printk("%s transport init ok\r\n", MESH_LOG_TAG);
+    g_sle_qos_busy = 0;
+
+    /* O13: 注册 SLE QoS 流控回调，获取链路忙闲状态 */
+    sle_transmission_callbacks_t qos_cb = { 0 };
+    qos_cb.send_data_cb = sle_qos_callback;
+    errcode_t qret = sle_transmission_register_callbacks(&qos_cb);
+    osal_printk("%s transport init ok (QoS cb: %s)\r\n",
+                MESH_LOG_TAG, (qret == ERRCODE_SUCC) ? "OK" : "FAIL");
     return ERRCODE_SUCC;
 }
 
@@ -174,6 +201,9 @@ void mesh_transport_on_server_connected(uint16_t conn_id, const sle_addr_t *addr
     g_conn_pool.server_count++;
     g_conn_pool.count++;
 
+    /* O12: 新连接建立时预先设置 DLE, 避免 turbo 时才协商带来额外延迟 */
+    sle_set_data_len(conn_id, 512);
+
     osal_printk("%s server connected: conn_id=%d, sle_derived=0x%04X (pending HELLO), "
                 "notify_ready in %dms, total=%d\r\n",
                 MESH_LOG_TAG, conn_id, sle_derived, MESH_SERVER_NOTIFY_DELAY_MS,
@@ -247,6 +277,9 @@ void mesh_transport_on_client_connected(uint16_t conn_id, const sle_addr_t *addr
 
     g_conn_pool.client_count++;
     g_conn_pool.count++;
+
+    /* O12: 新连接建立时预先设置 DLE */
+    sle_set_data_len(conn_id, 512);
 
     osal_printk("%s client connected: conn_id=%d, mesh_addr=0x%04X, total=%d\r\n",
                 MESH_LOG_TAG, conn_id, entry->mesh_addr, g_conn_pool.count);
@@ -722,14 +755,22 @@ uint8_t mesh_transport_cleanup_stale(void)
 
 /* ============================================================
  *  O2: Turbo 模式 — 动态调整所有邻居的 SLE 连接间隔
+ *  O12: PHY 2M + DLE — 在 turbo 期间提升物理层吞吐
  *
- *  FC 活跃时调用 enable=true 将间隔降到 15ms,
- *  FC 结束时调用 enable=false 恢复到 50ms.
- *  减少逐跳调度延迟, 大幅降低 RTT.
+ *  FC 活跃时调用 enable=true:
+ *    - 连接间隔降到 7.5ms
+ *    - PHY 切换 1M→2M (吞吐翻倍)
+ *    - DLE 设置 512B (减少 PDU 分片)
+ *  FC 结束时调用 enable=false:
+ *    - 连接间隔恢复 50ms
+ *    - PHY 恢复 1M (省功耗)
  * ============================================================ */
 void mesh_transport_set_turbo_mode(bool enable)
 {
     uint16_t intv = enable ? MESH_SLE_TURBO_INTV : MESH_SLE_CONN_INTV_MIN;
+    /* O12: turbo 模式使用 2M PHY, 正常模式恢复 1M (省功耗)
+     * 注: 4M PHY 在实测中导致大量 write_req err_code:2, 已回退至 2M */
+    uint8_t target_phy = enable ? SLE_PHY_2M : SLE_PHY_1M;
 
     uint8_t updated = 0;
     for (uint8_t i = 0; i < MESH_MAX_CONNECTIONS; i++) {
@@ -752,7 +793,31 @@ void mesh_transport_set_turbo_mode(bool enable)
             osal_printk("%s turbo: conn_id=%d update FAIL ret=0x%x\r\n",
                         MESH_LOG_TAG, entry->conn_id, ret);
         }
+
+        /* O12: 设置 PHY (2M turbo / 1M normal) */
+        sle_set_phy_t phy = { 0 };
+        phy.tx_format = SLE_RADIO_FRAME_1;
+        phy.rx_format = SLE_RADIO_FRAME_1;
+        phy.tx_phy    = target_phy;
+        phy.rx_phy    = target_phy;
+        phy.tx_pilot_density = 0;
+        phy.rx_pilot_density = 0;
+        sle_set_phy_param(entry->conn_id, &phy);
+
+        /* O12: turbo 时增大 DLE 以减少 PDU 分片数 (512B 足够覆盖 480B 数据包) */
+        if (enable) {
+            sle_set_data_len(entry->conn_id, 512);
+        }
     }
-    osal_printk("%s O2 turbo %s: intv=0x%04X, updated %d conns\r\n",
-                MESH_LOG_TAG, enable ? "ON" : "OFF", intv, updated);
+    osal_printk("%s O2 turbo %s: intv=0x%04X phy=%s, updated %d conns\r\n",
+                MESH_LOG_TAG, enable ? "ON" : "OFF", intv,
+                enable ? "2M" : "1M", updated);
+}
+
+/* ============================================================
+ *  O13: SLE QoS 查询 — 供上层检查是否有链路拥塞
+ * ============================================================ */
+bool mesh_transport_is_sle_busy(void)
+{
+    return g_sle_qos_busy > 0;
 }

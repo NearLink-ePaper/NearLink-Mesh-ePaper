@@ -459,7 +459,8 @@ static void mesh_app_data_received(uint16_t src_addr, const uint8_t *data, uint1
     /* ---- 全网拓扑协议: 0xFE 前缀 (由 BLE 网关发起全网拓扑采集) ---- */
     if (len >= 2 && data[0] == 0xFE) {
         if (data[1] == 0x01) {
-            /* TOPO_REQ (0xFE 01): 收到全网拓扑查询请求 → 回复自己的邻居列表 */
+            /* TOPO_REQ (0xFE 01 [GW_HI GW_LO]): 收到全网拓扑查询请求 → 回复自己的邻居列表
+             * F17: 新格式携带网关地址 (len>=4)，使用单播回复; 旧格式 (len==2) 兼容广播回复 */
             uint16_t my_addr = mesh_get_my_addr();
             uint16_t nbr_addrs[8];
             uint8_t nbr_cnt = mesh_transport_get_all_neighbor_addrs(nbr_addrs, 8);
@@ -476,9 +477,18 @@ static void mesh_app_data_received(uint16_t src_addr, const uint8_t *data, uint1
                 resp[pos++] = (nbr_addrs[i] >> 8) & 0xFF;
                 resp[pos++] = nbr_addrs[i] & 0xFF;
             }
-            mesh_broadcast(resp, pos);
-            osal_printk("%s topo RESP: self=0x%04X, nbrs=%d\r\n",
-                        MESH_LOG_TAG, my_addr, nbr_cnt);
+
+            /* F17: 优先单播回复网关 (更可靠: AODV 保证送达)，旧格式退化为广播 */
+            if (len >= 4) {
+                uint16_t gw_addr = ((uint16_t)data[2] << 8) | data[3];
+                mesh_send(gw_addr, resp, pos);
+                osal_printk("%s topo RESP unicast to gw=0x%04X: self=0x%04X, nbrs=%d\r\n",
+                            MESH_LOG_TAG, gw_addr, my_addr, nbr_cnt);
+            } else {
+                mesh_broadcast(resp, pos);
+                osal_printk("%s topo RESP broadcast (legacy): self=0x%04X, nbrs=%d\r\n",
+                            MESH_LOG_TAG, my_addr, nbr_cnt);
+            }
             return;  /* 拓扑协议包不转发给手机 / 用户回调 */
         }
         if (data[1] == 0x02 && len >= 5) {
@@ -488,9 +498,24 @@ static void mesh_app_data_received(uint16_t src_addr, const uint8_t *data, uint1
         }
     }
 
-    /* ---- O2: Turbo 控制帧 (0xFD 前缀) —— 远端下发快速传输模式开关 ---- */
+    /* ---- O2+F19: Turbo 控制帧 (0xFD 前缀) —— 远端下发快速传输模式开关 ---- */
     if (len >= 2 && data[0] == MESH_TURBO_MAGIC) {
         bool turbo_on = (data[1] == MESH_TURBO_ON);
+
+        /* F19: 扩展帧 (4 字节) 含序列号，防止旧 TURBO OFF 覆盖新 TURBO ON */
+        if (len >= 4) {
+            static uint16_t s_last_turbo_seq = 0;
+            uint16_t turbo_seq = ((uint16_t)data[2] << 8) | data[3];
+            int16_t diff = (int16_t)(turbo_seq - s_last_turbo_seq);
+            if (diff <= 0) {
+                osal_printk("%s TURBO %s seq=%d STALE (last=%d), skip\r\n",
+                            MESH_LOG_TAG, turbo_on ? "ON" : "OFF",
+                            turbo_seq, s_last_turbo_seq);
+                return;
+            }
+            s_last_turbo_seq = turbo_seq;
+        }
+
         osal_printk("%s TURBO %s from 0x%04X\r\n",
                     MESH_LOG_TAG, turbo_on ? "ON" : "OFF", src_addr);
         mesh_transport_set_turbo_mode(turbo_on);

@@ -430,18 +430,25 @@ void sle_uart_client_reconnect_cleanup(void)
     }
 
     /* P4: 退避表老化 — "已放弃"的条目在 5 分钟后重置, 允许重新尝试
-     * P9: 因冲突放弃的条目不重置 — 冲突是 SLE 栈的结构性问题, 重试无意义 */
+     * 冲突条目使用更长的冷却时间 (30 分钟) 后也重置, 因为长时间运行后
+     * SLE conn_id 池状态会变化, 之前冲突的目标可能不再冲突.
+     * 永久黑名单会导致长时间运行后网络分裂无法自愈. */
     for (uint8_t i = 0; i < MESH_BACKOFF_MAX; i++) {
         if (g_backoff_table[i].active &&
             g_backoff_table[i].fail_count >= MESH_BACKOFF_GIVEUP &&
-            g_backoff_table[i].conflict_count == 0 &&  /* P9: 跳过冲突条目 */
-            now > g_backoff_table[i].next_retry_ms &&
-            (now - g_backoff_table[i].next_retry_ms) > 300000) {  /* 5 分钟冷却 */
-            osal_printk("[sle mesh] backoff: reset [%02x:%02x:%02x:%02x:%02x:%02x] (age-out)\r\n",
-                        g_backoff_table[i].addr[0], g_backoff_table[i].addr[1],
-                        g_backoff_table[i].addr[2], g_backoff_table[i].addr[3],
-                        g_backoff_table[i].addr[4], g_backoff_table[i].addr[5]);
-            g_backoff_table[i].active = false;
+            now > g_backoff_table[i].next_retry_ms) {
+            uint32_t cooldown = (g_backoff_table[i].conflict_count > 0)
+                                ? MESH_CONFLICT_COOLDOWN_MS  /* 冲突条目: 30 分钟冷却 */
+                                : 300000;                    /* 普通失败: 5 分钟冷却 */
+            if ((now - g_backoff_table[i].next_retry_ms) > cooldown) {
+                osal_printk("[sle mesh] backoff: reset [%02x:%02x:%02x:%02x:%02x:%02x] "
+                            "(age-out, conflicts=%d)\r\n",
+                            g_backoff_table[i].addr[0], g_backoff_table[i].addr[1],
+                            g_backoff_table[i].addr[2], g_backoff_table[i].addr[3],
+                            g_backoff_table[i].addr[4], g_backoff_table[i].addr[5],
+                            g_backoff_table[i].conflict_count);
+                g_backoff_table[i].active = false;
+            }
         }
     }
 }
@@ -640,21 +647,39 @@ static void sle_uart_client_sample_seek_result_info_cbk(sle_seek_result_info_t *
      * 例外: 当 FILTER 明确指定了目标时, 无论地址大小都强制连接
      *       (用于构造菱形等非线性拓扑)
      *
-     * P3-Fallback: 如果节点已激活超过 MESH_P3_FALLBACK_TIMEOUT_MS
-     * 但邻居数仍然不足 (<2), 放宽限制允许向小地址也发起连接.
+     * P3-Fallback: 两种触发条件 (满足其一即放宽):
+     *   1. 启动初期: 超过 MESH_P3_FALLBACK_TIMEOUT_MS 且邻居 < 2
+     *   2. 分区检测: 邻居数在过去 10 分钟内持续 < 3, 说明网络可能已分裂,
+     *      需要主动向小地址节点发起连接来修复分区.
      * 已有 is_neighbor() 去重在前面, 不会产生重复连接. */
     uint16_t my_addr = g_mesh_node_addr;
 #if (MESH_CONNECT_FILTER_ADDR == 0x0000)
     if (remote_mesh_addr != 0 && remote_mesh_addr < my_addr) {
-        /* 检查回退条件: 长时间邻居不足则放宽 */
+        /* 检查回退条件 */
         static uint32_t s_p3_first_check_ms = 0;
+        static uint32_t s_last_nbr_sufficient_ms = 0;  /* 上次邻居 >= 3 的时间 */
+        uint32_t now_ms = osal_get_tick_ms();
         if (s_p3_first_check_ms == 0) {
-            s_p3_first_check_ms = osal_get_tick_ms();
+            s_p3_first_check_ms = now_ms;
             if (s_p3_first_check_ms == 0) s_p3_first_check_ms = 1;
+            s_last_nbr_sufficient_ms = now_ms;
         }
-        uint32_t elapsed = osal_get_tick_ms() - s_p3_first_check_ms;
+        uint32_t elapsed = now_ms - s_p3_first_check_ms;
         uint8_t nbr_count = mesh_transport_get_neighbor_count();
-        if (elapsed < MESH_P3_FALLBACK_TIMEOUT_MS || nbr_count >= 2) {
+
+        /* 跟踪邻居充足的最近时间点 */
+        if (nbr_count >= 3) {
+            s_last_nbr_sufficient_ms = now_ms;
+        }
+
+        /* 条件1: 启动初期邻居不足 */
+        bool startup_fallback = (elapsed >= MESH_P3_FALLBACK_TIMEOUT_MS && nbr_count < 2);
+        /* 条件2: 分区检测 — 邻居持续不足则尝试自愈 */
+        bool partition_fallback = (elapsed >= MESH_PARTITION_HEAL_TIMEOUT_MS &&
+                                   nbr_count < 3 &&
+                                   (now_ms - s_last_nbr_sufficient_ms) >= MESH_PARTITION_HEAL_TIMEOUT_MS);
+
+        if (!startup_fallback && !partition_fallback) {
             return;  /* 正常模式: 跳过小地址 */
         }
         /* Fallback 激活, 但要先检查是否真的能发起连接,
@@ -663,8 +688,9 @@ static void sle_uart_client_sample_seek_result_info_cbk(sle_seek_result_info_t *
             return;  /* 当前无法连接, 静默跳过 */
         }
         /* 真正要连了才打印一次 */
-        osal_printk("%s P3 fallback: connect to 0x%04X (nbrs=%d, wait=%lus)\r\n",
+        osal_printk("%s P3 fallback: connect to 0x%04X (nbrs=%d, %s, wait=%lus)\r\n",
                     SLE_UART_CLIENT_LOG, remote_mesh_addr, nbr_count,
+                    partition_fallback ? "partition-heal" : "startup",
                     (unsigned long)(elapsed / 1000));
     }
 #endif
@@ -687,16 +713,19 @@ static void sle_uart_client_sample_seek_result_info_cbk(sle_seek_result_info_t *
         return;
     }
     /* P4: 连接退避检查 — 如果最近连接该目标反复失败, 暂不重试 */
-    /* P6: 但如果已放弃的设备仍在广播, 说明它可能 reboot 了, 重置退避
-     * P9: 但不重置因 conn_id 冲突放弃的目标 — 冲突是结构性的, reboot 不解决 */
+    /* P6: 如果已放弃的设备仍在广播, 说明它可能 reboot 了或 SLE 状态已变化, 重置退避.
+     * 冲突条目也参与重置: 虽然冲突曾是 conn_id 串台导致, 但长时间后
+     * SLE 协议栈内部 conn_id 分配状态已变化, 之前冲突的节点可能不再冲突.
+     * 永久拒绝冲突节点会导致长时间运行后网络分裂无法自愈. */
     {
         mesh_backoff_entry_t *be = backoff_find(seek_result_data->addr.addr);
-        if (be != NULL && be->fail_count >= MESH_BACKOFF_GIVEUP &&
-            be->conflict_count == 0) {
-            osal_printk("%s backoff reset: scanned alive [%02x:%02x], was given up\r\n",
+        if (be != NULL && be->fail_count >= MESH_BACKOFF_GIVEUP) {
+            osal_printk("%s backoff reset: scanned alive [%02x:%02x], was given up"
+                        " (conflicts=%d)\r\n",
                         SLE_UART_CLIENT_LOG,
                         seek_result_data->addr.addr[4],
-                        seek_result_data->addr.addr[5]);
+                        seek_result_data->addr.addr[5],
+                        be->conflict_count);
             be->fail_count = 0;
             be->conflict_count = 0;
             be->next_retry_ms = 0;
@@ -710,13 +739,14 @@ static void sle_uart_client_sample_seek_result_info_cbk(sle_seek_result_info_t *
     /* P9: 当邻居足够且目标已可通过路由中继到达时, 跳过直连.
      * 这避免了不必要的 outgoing 连接触发 SLE 协议栈的 conn_id 串台 bug,
      * 从而防止假 disconnect 事件破坏既有连接的稳定性.
-     * 例外: 邻居 < 2 时仍允许连接 (网络韧性不足, 需要更多直连). */
+     * 阈值从 2 提升到 3: 仅有 2 个邻居的节点仍应尝试建立更多直连,
+     * 以提供网络冗余度, 防止单点故障导致分裂后无法自愈. */
     {
         uint8_t nbr_count = mesh_transport_get_neighbor_count();
-        if (nbr_count >= 2 && remote_mesh_addr != 0) {
+        if (nbr_count >= 3 && remote_mesh_addr != 0) {
             uint16_t relay_hop = mesh_route_lookup(remote_mesh_addr);
             if (relay_hop != MESH_ADDR_UNASSIGNED) {
-                /* 目标已可经路由中继到达, 无需建立直连 */
+                /* 目标已可经路由中继到达, 且邻居充足, 无需建立直连 */
                 return;
             }
         }

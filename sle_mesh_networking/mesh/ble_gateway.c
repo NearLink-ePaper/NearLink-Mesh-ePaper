@@ -111,8 +111,8 @@ extern void mesh_transport_set_turbo_mode(bool enable); /**< 设置 Turbo 模式
  *  各节点响应 TOPO_RESP 报告其邻居列表。网关汇总后通过 BLE Notify 上报给 APP。
  *  超时时间可根据网络规模调整：节点越多、跳数越深，超时应越长。
  * ===================================================================== */
-#define TOPO_COLLECT_TIMEOUT_MS   2000   /**< 拓扑收集超时时间 (ms)。超过此时间未收齐所有响应则汇总已有结果。
-                                             小型网络 (5 以内) 可设 1000ms，大型网络建议 3000-5000ms */
+#define TOPO_COLLECT_TIMEOUT_MS   3000   /**< F17: 拓扑收集超时时间 (ms)。
+                                             从 2000ms 增大到 3000ms，给单播 TOPO_RESP + AODV 路由发现预留足够时间 */
 #define TOPO_MAX_NODES            16     /**< 最大可记录的拓扑节点数。如果网络节点超过此值需扩大 */
 #define TOPO_MAGIC                0xFE   /**< 拓扑广播帧的魔术字节，用于区分拓扑命令与普通数据 */
 #define TOPO_REQ_CMD              0x01   /**< 拓扑请求命令码 */
@@ -127,12 +127,13 @@ extern void mesh_transport_set_turbo_mode(bool enable); /**< 设置 Turbo 模式
 static struct {
     uint8_t  active;                         /**< 收集是否活跃: 0=空闲, 1=正在收集 */
     uint32_t start_time;                     /**< 收集开始时间戳 (ms) */
+    uint32_t last_resp_tick;                 /**< O11: 最后一次收到 TOPO_RESP 的时间戳 (ms) */
     uint16_t nodes[TOPO_MAX_NODES];          /**< 已发现节点地址列表 */
     uint8_t  hops[TOPO_MAX_NODES];           /**< 各节点到网关的跳数 */
     uint8_t  count;                          /**< 已发现节点总数 */
-    uint8_t  expected_resps;                 /**< 预期的响应数量 (等于直连邻居数) */
     uint16_t resp_src[TOPO_MAX_NODES];       /**< 已收到响应的节点地址 (去重用) */
     uint8_t  resp_count;                     /**< 已收到的响应数量 */
+    uint8_t  retry_done;                     /**< F17: 自动重试标记 (0=未重试, 1=已重试过) */
 } g_topo_collect = {0};
 
 /* =====================================================================
@@ -173,6 +174,9 @@ static struct {
     uint16_t target_addrs[MESH_MCAST_MAX_TARGETS]; /**< 组播目标地址列表 */
     uint8_t  target_done[MESH_MCAST_MAX_TARGETS];  /**< 每个目标的完成状态: 0=待定, 1=OK, 2=CRC_ERR, 3=超时 */
     uint8_t  completed_count;     /**< 已完成（包括成功和失败）的目标数 */
+    /* F23: 保存 MCAST_START 帧用于重播，确保后加入的节点也能收到 */
+    uint8_t  mcast_start_frame[250]; /**< MCAST_START 帧内容缓存 */
+    uint16_t mcast_start_len;        /**< MCAST_START 帧长度 */
     uint8_t  buf[IMG_GW_CACHE_SIZE]; /**< 图片原始数据缓存区 */
 } g_img_cache = {0};
 
@@ -224,27 +228,27 @@ static struct {
 #define FC_W_MIN            8       /**< 最小窗口大小 (包数)。拥塞严重时窗口不会低于此值 */
 #define FC_W_MAX            80      /**< 最大窗口大小 (包数)。防止窗口无限增长淡没接收端 */
 #define FC_D_INIT           5       /**< 初始包间延时 (ms)。实际由 fc_start() 动态设置:
-                                         1跳=8ms, 2跳=10ms, 3+跳=15ms */
+                                         O8: 1跳=5ms, 2跳=7ms, 3+跳=10ms */
 #define FC_D_MIN            0       /**< 最小包间延时 (ms)。0=无延时连发, 适合直连场景 */
 #define FC_D_MAX            50      /**< 最大包间延时 (ms)。严重拥塞时延时不超过此值 */
 #define FC_SS_INIT          60      /**< 初始慢启动阈值 (ssthresh)。实际由 fc_start() 动态设置:
-                                         1跳=40, 2跳=20, 3+跳=30 */
-#define FC_PKTS_PER_TICK    3       /**< O3: 每 tick 批量发送包数。充分利用 SLE TX 缓冲区。
-                                         增大可提高发送速率，但可能导致 TX 溢出 */
-#define FC_CHKPT_TIMEOUT_1HOP  2500  /**< 1跳 CHECKPOINT 初始超时 (ms)。包含 Turbo 切换期 ACK 延迟 */
-#define FC_CHKPT_TIMEOUT_2HOP  5000  /**< 2跳 CHECKPOINT 初始超时 (ms)。匹配实测 RTT ~2.7s */
-#define FC_CHKPT_TIMEOUT_3HOP  5000  /**< 3+跳 CHECKPOINT 初始超时 (ms)。多跳 RTT 更长，可增大到 8000-10000 */
-#define FC_CHKPT_TIMEOUT_DEF   3000  /**< 路由未知时默认 CHECKPOINT 超时 (ms) */
+                                         O8: 1跳=50, 2跳=30, 3+跳=30 */
+#define FC_PKTS_PER_TICK    5       /**< O8: 每 tick 批量发送包数。3→5，配合 5ms tick 充分利用 SLE TX 缓冲区 */
+#define FC_CHKPT_TIMEOUT_1HOP  1500  /**< O8: 1跳 CHECKPOINT 初始超时 (ms)。从 2500 降至 1500，
+                                              配合 Turbo 7.5ms 间隔，实测 RTT 应 <500ms */
+#define FC_CHKPT_TIMEOUT_2HOP  3000  /**< O8: 2跳 CHECKPOINT 初始超时 (ms)。从 5000 降至 3000 */
+#define FC_CHKPT_TIMEOUT_3HOP  4000  /**< O8: 3+跳 CHECKPOINT 初始超时 (ms)。从 5000 降至 4000 */
+#define FC_CHKPT_TIMEOUT_DEF   2500  /**< 路由未知时默认 CHECKPOINT 超时 (ms) */
 #define FC_CHKPT_MAX_RETRY  2       /**< CHECKPOINT 最多重发次数。超过后视为严重拥塞，重发整段 */
 #define FC_RTO_MIN          500     /**< 自适应超时全局下限 (ms)。具体按跳数见 fc_rto_min_for_hops() */
-#define FC_RTO_MIN_1HOP     1000    /**< F8: 1跳 RTO 下限 (ms)。保证待直连节点响应时间 */
-#define FC_RTO_MIN_2HOP     2000    /**< F8: 2跳 RTO 下限 (ms)。包含中继转发延迟 */
-#define FC_RTO_MIN_3HOP     3000    /**< F8: 3+跳 RTO 下限 (ms)。多跳需更大容忍度 */
+#define FC_RTO_MIN_1HOP     600     /**< O8: 1跳 RTO 下限 (ms)。从 1000 降至 600，配合 7.5ms Turbo */
+#define FC_RTO_MIN_2HOP     1200    /**< O8: 2跳 RTO 下限 (ms)。从 2000 降至 1200 */
+#define FC_RTO_MIN_3HOP     2000    /**< O8: 3+跳 RTO 下限 (ms)。从 3000 降至 2000 */
 #define FC_RTO_MAX          10000   /**< 自适应超时上限 (ms)。防止指数退避后 RTO 无限增长 */
 #define FC_SRTT_ALPHA_SHIFT  3      /**< SRTT 平滑因子 α = 1/8 (RFC 6298)。右移 3 位实现定点除法 */
 #define FC_RTTVAR_BETA_SHIFT 2      /**< RTTVAR 平滑因子 β = 1/4 (RFC 6298)。右移 2 位实现定点除法 */
 #define FC_RESULT_TIMEOUT_MS 10000  /**< END 发送后等待 RESULT/MISSING 最大超时 (ms) */
-#define FC_RETX_DELAY_MS    15      /**< 补包固定包间延时 (ms)。避免快速重传再次刷爆接收端 */
+#define FC_RETX_DELAY_MS    8       /**< O8: 补包固定包间延时 (ms)。15→8，配合 Turbo 7.5ms 加快重传 */
 #define FC_LOSS_NONE        0       /**< 丢包率阈值: 0% (无丢包，加速) */
 #define FC_LOSS_LIGHT       15      /**< 丢包率阈值: <15% (轻微丢包，保持不变) */
 #define FC_LOSS_MEDIUM      40      /**< 丢包率阈值: <40% (中度拥塞，乘性减半窗口) */
@@ -665,20 +669,30 @@ static void gw_handle_topology_query(void)
     uint8_t  rt_count = mesh_route_get_all_destinations(rt_addrs, rt_hops, 32);
     for (uint8_t i = 0; i < rt_count; i++) topo_collect_add(rt_addrs[i], rt_hops[i]);
 
-    uint8_t topo_req[2] = { TOPO_MAGIC, TOPO_REQ_CMD };
+    /* F17: TOPO_REQ 中携带网关地址，允许远端节点单播回复。
+     * 格式: [0xFE, 0x01, GW_ADDR_HI, GW_ADDR_LO]
+     * 旧格式: [0xFE, 0x01] (2字节)  新格式: [0xFE, 0x01, HI, LO] (4字节) */
+    uint16_t self_addr = mesh_get_my_addr();
+    uint8_t topo_req[4] = { TOPO_MAGIC, TOPO_REQ_CMD,
+                            (uint8_t)(self_addr >> 8), (uint8_t)(self_addr & 0xFF) };
     mesh_broadcast(topo_req, sizeof(topo_req));
     g_topo_collect.active = 1;
     g_topo_collect.start_time = osal_get_tick_ms();
-    g_topo_collect.expected_resps = nbr_count;
+    g_topo_collect.last_resp_tick = 0;  /* O11: 尚无响应 */
     g_topo_collect.resp_count = 0;
-    osal_printk("%s topo REQ broadcast, expect %d RESPs\r\n", BLE_GW_LOG, nbr_count);
+    g_topo_collect.retry_done = 0;
+    osal_printk("%s topo REQ broadcast, pre-discovered %d nodes, nbrs=%d, conns=%d\r\n",
+                BLE_GW_LOG, g_topo_collect.count, nbr_count,
+                mesh_transport_get_neighbor_count());
 }
 
 /**
  * @brief  处理其他节点的拓扑响应 (TOPO_RESP)
  * @param  data  响应帧数据: [TOPO_MAGIC, TOPO_RESP_CMD, ADDR_HI, ADDR_LO, NBR_CNT, NBR_ADDR(2)...]
  * @param  len   数据长度
- * @note   当所有预期响应收齐后立即汇总结果，否则等待超时
+ * @note   不提前结束收集, 始终等待 TOPO_COLLECT_TIMEOUT_MS 超时.
+ *         因为 TOPO_REQ 洪泛全网, 所有节点(不仅直连邻居)都会响应,
+ *         提前结束会丢失多跳节点的响应.
  */
 void ble_gateway_on_topo_resp(const uint8_t *data, uint16_t len)
 {
@@ -686,13 +700,22 @@ void ble_gateway_on_topo_resp(const uint8_t *data, uint16_t len)
     if (len < 5) return;
     uint16_t resp_addr = ((uint16_t)data[2] << 8) | data[3];
     uint8_t  nbr_cnt   = data[4];
-    topo_collect_add(resp_addr, 2);
+
+    /* 使用路由表/邻居表查询响应者的实际跳数, 而不是硬编码 2 */
+    uint8_t resp_hop = mesh_route_get_hop_count(resp_addr);
+    if (resp_hop == 0xFF) {
+        resp_hop = 2; /* 路由表中无记录时保守估计 */
+    }
+    topo_collect_add(resp_addr, resp_hop);
+
     uint16_t idx = 5;
     for (uint8_t i = 0; i < nbr_cnt && idx + 1 < len; i++) {
         uint16_t nbr = ((uint16_t)data[idx] << 8) | data[idx + 1];
-        topo_collect_add(nbr, 2);
+        topo_collect_add(nbr, resp_hop + 1); /* 响应者的邻居 = 响应者距离 + 1 */
         idx += 2;
     }
+
+    /* 响应去重记录 (仅用于日志统计) */
     uint8_t already = 0;
     for (uint8_t i = 0; i < g_topo_collect.resp_count; i++) {
         if (g_topo_collect.resp_src[i] == resp_addr) { already = 1; break; }
@@ -700,22 +723,64 @@ void ble_gateway_on_topo_resp(const uint8_t *data, uint16_t len)
     if (!already && g_topo_collect.resp_count < TOPO_MAX_NODES) {
         g_topo_collect.resp_src[g_topo_collect.resp_count++] = resp_addr;
     }
-    if (g_topo_collect.resp_count >= g_topo_collect.expected_resps &&
-        g_topo_collect.expected_resps > 0) {
-        g_topo_collect.active = 0;
-        topo_collect_send_result();
-    }
+    g_topo_collect.last_resp_tick = osal_get_tick_ms();  /* O11: 记录最后响应时间 */
+    /* 不提前结束: TOPO_REQ 洪泛全网, 全网节点都会响应 (not just direct neighbors).
+     * 基于 expected_resps = nbr_count 的早期终止会在直连邻居响应到达后
+     * 立即结束, 丢失 2+ 跳节点的 TOPO_RESP.
+     * 改为始终等待超时 (TOPO_COLLECT_TIMEOUT_MS), 确保全网响应有足够时间到达. */
 }
 
 /**
  * @brief 拓扑收集超时检测，在主循环中周期性调用
- * @note  超过 TOPO_COLLECT_TIMEOUT_MS 后强制汇总已收集的结果并上报
+ * @note  超过 TOPO_COLLECT_TIMEOUT_MS 后强制汇总已收集的结果并上报。
+ *        F17: 当首次超时结果为 0 节点但连接池非空时，自动重试一次。
+ *        这解决了以下场景: 首次 TOPO_REQ 因 mesh_addr 未填充或 SLE 发送
+ *        暂时失败导致无响应，短暂延迟后连接已稳定可重试。
  */
 void ble_gateway_topo_tick(void)
 {
     if (!g_topo_collect.active) return;
     uint32_t elapsed = osal_get_tick_ms() - g_topo_collect.start_time;
+    /* O11: 静默期早期终止 —— 已有响应且超过 1s 后 500ms 无新响应，视为全网已回复
+     * 避免始终等满 3000ms 浪费时间；多跳节点通常在 1s 内即可响应 */
+    if (g_topo_collect.resp_count > 0 && elapsed >= 1000 &&
+        g_topo_collect.last_resp_tick > 0 &&
+        (osal_get_tick_ms() - g_topo_collect.last_resp_tick) >= 500) {
+        osal_printk("%s topo early finish: %d RESPs, quiet 500ms\r\n",
+                    BLE_GW_LOG, g_topo_collect.resp_count);
+        g_topo_collect.active = 0;
+        topo_collect_send_result();
+        return;
+    }
     if (elapsed >= TOPO_COLLECT_TIMEOUT_MS) {
+        /* F17: 自动重试 — 首次 0 结果且有活跃连接时再试一次 */
+        if (g_topo_collect.count == 0 &&
+            !g_topo_collect.retry_done &&
+            mesh_transport_get_neighbor_count() > 0) {
+            osal_printk("%s topo retry: 0 nodes but %d conns, retrying...\r\n",
+                        BLE_GW_LOG, mesh_transport_get_neighbor_count());
+            g_topo_collect.retry_done = 1;
+            /* 重新预采集（mesh_addr 可能已通过 F17 快速填充） */
+            uint16_t nbr_addrs[16];
+            uint8_t nbr_count = mesh_transport_get_all_neighbor_addrs(nbr_addrs, 16);
+            for (uint8_t i = 0; i < nbr_count; i++) topo_collect_add(nbr_addrs[i], 1);
+            uint16_t rt_addrs[32];
+            uint8_t rt_hops[32];
+            uint8_t rt_count = mesh_route_get_all_destinations(rt_addrs, rt_hops, 32);
+            for (uint8_t i = 0; i < rt_count; i++) topo_collect_add(rt_addrs[i], rt_hops[i]);
+            /* 重新广播 TOPO_REQ */
+            uint16_t self_addr = mesh_get_my_addr();
+            uint8_t topo_req[4] = { 0xFE, 0x01,
+                                    (uint8_t)(self_addr >> 8), (uint8_t)(self_addr & 0xFF) };
+            mesh_broadcast(topo_req, sizeof(topo_req));
+            g_topo_collect.start_time = osal_get_tick_ms();
+            osal_printk("%s topo retry broadcast, pre-discovered %d nodes\r\n",
+                        BLE_GW_LOG, g_topo_collect.count);
+            return;
+        }
+        osal_printk("%s topo timeout: %d RESPs, %d nodes%s\r\n",
+                    BLE_GW_LOG, g_topo_collect.resp_count, g_topo_collect.count,
+                    g_topo_collect.retry_done ? " (after retry)" : "");
         g_topo_collect.active = 0;
         topo_collect_send_result();
     }
@@ -812,17 +877,49 @@ static void fc_send_end(void)
 }
 
 /**
+ * @brief  F19: Turbo 控制帧全局序列号
+ * @note   每次发送 TURBO ON/OFF 广播时递增，中继节点根据序列号过滤过时帧，
+ *         防止旧 TURBO OFF 覆盖新 TURBO ON 导致传输速度骤降。
+ */
+static uint16_t g_turbo_seq = 0;
+
+/** @brief  O9: 延迟 TURBO OFF 广播的调度时间戳 (0=无待发) */
+static uint32_t g_turbo_off_scheduled_tick = 0;
+#define TURBO_OFF_COOLDOWN_MS  1000  /* O9: TURBO OFF 冷却期 (ms)，避免连续传输间的快速 ON/OFF 切换 */
+
+/**
  * @brief  O2: 关闭 Turbo 模式，恢复正常 SLE 连接间隔
- * @note   广播 TURBO_OFF 给中继节点，让它们也同步恢复。
- *         在传输完成/中止/断连时调用
+ * @note   F18: 自发自收 (hops=0) 未开启 Turbo，直接跳过
+ *         O9:  正常传输完成时延迟广播 TURBO OFF，给后续传输留出冷却期
+ *         紧急路径 (断连/取消/超限) 仍由 fc_stop_turbo_now() 立即关闭
  */
 static void fc_stop_turbo(void)
 {
+    /* F18: 自发自收时未开启 Turbo，无需关闭 */
+    if (g_fc.transfer_hops == 0) {
+        return;
+    }
+    /* O9: 本地立即恢复正常间隔，广播 OFF 延迟发出 */
     mesh_transport_set_turbo_mode(false);
-    /* 广播 TURBO_OFF 给中继节点，通知全网恢复正常连接间隔 */
-    uint8_t cmd[2] = { MESH_TURBO_MAGIC, MESH_TURBO_OFF };
+    g_turbo_off_scheduled_tick = osal_get_tick_ms();
+    if (g_turbo_off_scheduled_tick == 0) g_turbo_off_scheduled_tick = 1; /* 避免 0 误判为"无待发" */
+}
+
+/**
+ * @brief  紧急关闭 Turbo: 断连/取消/超限时立即广播 TURBO OFF
+ */
+static void fc_stop_turbo_now(void)
+{
+    g_turbo_off_scheduled_tick = 0;  /* O9: 取消任何待发的延迟 OFF */
+    if (g_fc.transfer_hops == 0) {
+        return;  /* F18: 自发自收未开启 Turbo */
+    }
+    mesh_transport_set_turbo_mode(false);
+    g_turbo_seq++;
+    uint8_t cmd[4] = { MESH_TURBO_MAGIC, MESH_TURBO_OFF,
+                        (uint8_t)(g_turbo_seq >> 8), (uint8_t)(g_turbo_seq & 0xFF) };
     mesh_gateway_inject(0xFFFF, cmd, sizeof(cmd));
-    osal_printk("%s O2 turbo OFF\r\n", BLE_GW_LOG);
+    osal_printk("%s O2 turbo OFF (seq=%d)\r\n", BLE_GW_LOG, g_turbo_seq);
 }
 
 /**
@@ -962,13 +1059,11 @@ static void fc_start(void)
     uint16_t chkpt_to;
 
     if (g_img_cache.is_multicast) {
-        /* 组播: 使用保守的 2 跳等效参数。
-         * 由于数据通过广播发送到多个目标，无法针对单个目标优化，
-         * 使用适中的窗口和延时确保大多数节点能可靠接收。 */
+        /* O8: 组播: 使用适中参数 (广播到多节点，Turbo 7.5ms 允许更快) */
         hops = 2;
-        w_init = 12;
-        d_init = 12;
-        ss_init = 20;
+        w_init = 15;
+        d_init = 8;
+        ss_init = 25;
         chkpt_to = FC_CHKPT_TIMEOUT_3HOP;
         osal_printk("%s FC MCAST mode: %d targets, using conservative params\r\n",
                     BLE_GW_LOG, g_img_cache.target_count);
@@ -976,9 +1071,10 @@ static void fc_start(void)
     /* ---- P0: 根据目标节点跳数自适应初始参数 (单播) ---- */
     hops = mesh_route_get_hop_count(g_img_cache.dst_addr);
 
-    /* F13: 自发自收检测 —— 目标地址等于本节点，直接本地处理 */
+    /* F13+F20: 自发自收检测 —— 仅当目标地址等于本节点时才走本地快速路径
+     * F20: 移除 hops==0xFF 条件，避免路由丢失时误判远端节点为自发自收 */
     uint16_t my_addr = mesh_get_my_addr();
-    if (g_img_cache.dst_addr == my_addr || (hops == 0xFF && my_addr != 0)) {
+    if (g_img_cache.dst_addr == my_addr) {
         hops = 0;
         w_init = g_img_cache.fc_pkt_count;  /* 本地处理，一次发完所有包 */
         d_init = 0;
@@ -1007,29 +1103,31 @@ static void fc_start(void)
             osal_printk("%s FC P3 fallback (persistent): neighbor flag p3_hops=%d, "
                         "using conservative params\r\n", BLE_GW_LOG, p3_hops);
         } else {
-            /* 真正的近距离邻居 (W降至20, D升至8: 避免turbo切换期淹没接收端) */
-            w_init = 20;  d_init = 8;   ss_init = 40;
+            /* O8: 真正的近距离邻居 (Turbo 7.5ms，可用更激进参数) */
+            w_init = 25;  d_init = 5;   ss_init = 50;
             chkpt_to = FC_CHKPT_TIMEOUT_1HOP;
         }
     } else if (hops == 2) {
-        /* 2 跳 (1 个中继): 中等保守参数 */
-        w_init = 15;  d_init = 10;  ss_init = 20;
+        /* O8: 2 跳 (1 个中继): Turbo 7.5ms 允许更高吞吐 */
+        w_init = 20;  d_init = 7;   ss_init = 30;
         chkpt_to = FC_CHKPT_TIMEOUT_2HOP;
     } else if (hops >= 3 && hops != 0xFF) {
-        /* O5: 3+ 跳 (2+ 个中继): 提高起步窗口和慢启动阈值 (8→12, 16→30) */
-        w_init = 12;  d_init = 15;  ss_init = 30;
+        /* O8: 3+ 跳 (2+ 个中继): Turbo 7.5ms + 5ms tick 允许减小延时 */
+        w_init = 15;  d_init = 10;  ss_init = 30;
         chkpt_to = FC_CHKPT_TIMEOUT_3HOP;
     } else {
-        /* 路由未知 (hops=0xFF): 无法确定跳数，使用中等保守参数 */
-        w_init = 10;  d_init = 10;  ss_init = 20;
-        chkpt_to = FC_CHKPT_TIMEOUT_DEF;
+        /* O8+F29b: 路由未知 (hops=0xFF): 使用 3+ 跳保守参数
+         * 路由丢失后 RREQ 重建通常得到 3+ 跳路径，
+         * 用 2-hop 参数 (TO=2500) 极易超时，改用 3-hop 保守值 */
+        w_init = 15;  d_init = 10;  ss_init = 30;
+        chkpt_to = FC_CHKPT_TIMEOUT_3HOP;
     }
     } /* end of: if (g_img_cache.is_multicast) ... else { ... } */
 
-    /* O6+F16: 根据跳数动态设置 START 延时
-     * 多跳场景需要更长时间让 Turbo 连接间隔变更传播到所有中继节点
-     * 1跳=300ms, 2跳=500ms, 3+跳=800ms */
-    uint16_t start_delay = (hops <= 1) ? 300 : (hops == 2) ? 500 : 800;
+    /* O8: 根据跳数动态设置 START 延时 (O6+F16 基础上缩短)
+     * Turbo 7.5ms 间隔传播更快，减少等待时间
+     * 1跳=200ms, 2跳=300ms, 3+跳=500ms */
+    uint16_t start_delay = (hops <= 1) ? 200 : (hops == 2) ? 300 : 500;
 
     g_fc.state        = FC_START_WAIT;
     g_fc.window       = w_init;
@@ -1057,17 +1155,49 @@ static void fc_start(void)
     g_mesh_log_suppress = true;     /* P1: 抑制 Mesh 层冗余日志，减少串口占用 */
     sle_uart_pause_scan();           /* P3: 暂停 SLE 扫描，减少射频干扰提高传输可靠性 */
 
-    /* O2: 本节点进入 Turbo 模式 (7.5ms 连接间隔) + 广播通知全网中继节点同步切换 */
-    mesh_transport_set_turbo_mode(true);
-    {
-        uint8_t turbo_cmd[2] = { MESH_TURBO_MAGIC, MESH_TURBO_ON };
-        mesh_broadcast(turbo_cmd, 2);
+    /* O2: 本节点进入 Turbo 模式 + 广播通知全网中继节点同步切换
+     * F18: 自发自收 (hops=0) 无需中继，跳过 Turbo 广播避免乱序竞态
+     * F19: 广播帧携带序列号，中继节点据此过滤过时帧
+     * O9:  取消前一次传输遗留的延迟 TURBO OFF */
+    g_turbo_off_scheduled_tick = 0;  /* O9: 取消待发的延迟 OFF */
+    if (hops != 0) {
+        mesh_transport_set_turbo_mode(true);
+        g_turbo_seq++;
+        uint8_t turbo_cmd[4] = { MESH_TURBO_MAGIC, MESH_TURBO_ON,
+                                  (uint8_t)(g_turbo_seq >> 8), (uint8_t)(g_turbo_seq & 0xFF) };
+        mesh_broadcast(turbo_cmd, 4);
     }
 
     osal_printk("%s FC start: %d pkts, hops=%d W=%d D=%d SS=%d TO=%d startDelay=%d\r\n",
                 BLE_GW_LOG, g_img_cache.fc_pkt_count, hops,
                 g_fc.window, g_fc.delay_ms, g_fc.ssthresh, g_fc.chkpt_timeout,
                 start_delay);
+
+    /* O10: 自发自收内联快速路径 —— 完全跳过 tick 驱动的状态机
+     * 自发自收时所有 mesh 操作均为本地同步回环 (loopback):
+     *   fc_inject_data_pkt → image_receiver DATA (本地)
+     *   fc_send_checkpoint → image_receiver CHKPT → CHKPT_ACK (同步)
+     *   fc_send_end → image_receiver END → CRC → RESULT → send_image_response → BLE 通知手机
+     * 全部在一次函数调用中完成，无需状态机 tick 驱动，延迟从 ~2200ms 降至 <1ms */
+    if (hops == 0) {
+        g_fc.state = FC_SENDING;  /* 非 IDLE，RESULT 处理器需要此状态 */
+        for (uint16_t seq = 0; seq < g_img_cache.fc_pkt_count; seq++) {
+            fc_inject_data_pkt(seq);
+        }
+        fc_send_checkpoint();  /* 同步: CHKPT → handle_checkpoint → CHKPT_ACK → fc_on_checkpoint_ack */
+        fc_send_end();         /* 同步: END → handle_end → CRC OK → RESULT → BLE notify → FC_IDLE */
+        /* send_image_response(0x86) 已在 fc_send_end 同步调用链中完成:
+         *   FC_IDLE, g_img_cache.active=0, fc_stop_turbo, resume_scan, BLE notify */
+        if (g_fc.state != FC_IDLE) {
+            /* 兜底: 若同步路径异常未到达 IDLE，强制清理 */
+            g_fc.state = FC_IDLE;
+            g_mesh_log_suppress = false;
+            sle_uart_resume_scan();
+            g_img_cache.active = 0;
+        }
+        osal_printk("%s FC self-send complete (O10 inline fast path)\r\n", BLE_GW_LOG);
+        return;
+    }
 }
 
 /**
@@ -1095,6 +1225,19 @@ bool ble_gateway_fc_is_active(void)
  */
 void ble_gateway_img_tick(void)
 {
+    /* O9: 延迟 TURBO OFF 广播 —— 在冷却期到期且无新 FC 启动时实际发出 */
+    if (g_turbo_off_scheduled_tick != 0 && g_fc.state == FC_IDLE) {
+        uint32_t elapsed = osal_get_tick_ms() - g_turbo_off_scheduled_tick;
+        if (elapsed >= TURBO_OFF_COOLDOWN_MS) {
+            g_turbo_off_scheduled_tick = 0;
+            g_turbo_seq++;
+            uint8_t cmd[4] = { MESH_TURBO_MAGIC, MESH_TURBO_OFF,
+                                (uint8_t)(g_turbo_seq >> 8), (uint8_t)(g_turbo_seq & 0xFF) };
+            mesh_gateway_inject(0xFFFF, cmd, sizeof(cmd));
+            osal_printk("%s O9 deferred turbo OFF (seq=%d)\r\n", BLE_GW_LOG, g_turbo_seq);
+        }
+    }
+
     if (g_fc.state == FC_IDLE) return;
 
     uint32_t now = osal_get_tick_ms();
@@ -1104,6 +1247,32 @@ void ble_gateway_img_tick(void)
     /* ── 等待 START 传播: 延时 start_delay ms 让目标节点和中继做好准备 ── */
     case FC_START_WAIT:
         if (now - g_fc.state_tick >= g_fc.start_delay) {
+            /* F23: 组播模式下，在开始发数据前重播 MCAST_START
+             * 网络拓扑可能在缓存期间发生变化（节点断连/重连），
+             * 重播确保新上线的节点也进入接收状态 */
+            if (g_img_cache.is_multicast && g_img_cache.mcast_start_len > 0) {
+                mesh_broadcast(g_img_cache.mcast_start_frame, g_img_cache.mcast_start_len);
+                osal_printk("%s FC MCAST_START re-broadcast before data\r\n", BLE_GW_LOG);
+            }
+            /* F29a: 单播模式下重新注入 START 命令
+             * 原始 START (在 IMG_START 缓存时注入) 可能因路由不稳定而丢失，
+             * 导致目标节点不在接收状态，后续所有 CHKPT 被 ignore。
+             * 在 FC 数据发送前补发一次 START 确保目标已就绪 */
+            if (!g_img_cache.is_multicast && g_img_cache.start_len > 0) {
+                uint8_t sbuf[16];
+                sbuf[0] = 0x04;
+                (void)memcpy_s(&sbuf[1], sizeof(sbuf) - 1,
+                               g_img_cache.start_payload, g_img_cache.start_len);
+                uint8_t slen = 1 + g_img_cache.start_len;
+                /* O4: 覆盖 pkt_count 为 FC 大包数 */
+                if (slen >= 5) {
+                    sbuf[3] = (g_img_cache.fc_pkt_count >> 8) & 0xFF;
+                    sbuf[4] = g_img_cache.fc_pkt_count & 0xFF;
+                }
+                mesh_gateway_inject(g_img_cache.dst_addr, sbuf, slen);
+                osal_printk("%s FC F29: re-inject START to 0x%04X\r\n",
+                            BLE_GW_LOG, g_img_cache.dst_addr);
+            }
             /* START 已传播完成，开始发送首段数据 */
             g_fc.state = FC_SENDING;
             g_fc.seg_start = 0;
@@ -1119,6 +1288,10 @@ void ble_gateway_img_tick(void)
     case FC_SENDING: {
         /* P4: 包间延时门控 —— 距上次发包未达 delay_ms 则不发送 */
         if (g_fc.delay_ms > 0 && (now - g_fc.last_pkt_tick) < g_fc.delay_ms) {
+            break;
+        }
+        /* O13: SLE QoS 拥塞感知 — 链路 BUSY/FLOWCTRL 时暂停发送, 避免数据积压 */
+        if (mesh_transport_is_sle_busy()) {
             break;
         }
 
@@ -1140,13 +1313,27 @@ void ble_gateway_img_tick(void)
         }
 
         if (g_fc.next_seq >= seg_end) {
-            /* 本段发完 → 发送 CHECKPOINT 请求目标报告已收包数 */
-            fc_send_checkpoint();
-            g_fc.ack_arrived = 0;
-            g_fc.chkpt_retry = 0;
-            g_fc.state = FC_WAIT_CHKPT;
-            g_fc.state_tick = now;
-            g_fc.pipeline_seq = g_fc.next_seq;  /* O1: 缓存当前发送位置，启动流水线预发 */
+            /* F21: 自发自收时 ACK 可能已在 SENDING 期间到达并暂存
+             * 此时无需发 CHECKPOINT，直接以暂存的 ACK 进入处理流程 */
+            if (g_fc.ack_arrived && g_fc.transfer_hops == 0) {
+                g_fc.chkpt_retry = 0;
+                g_fc.state = FC_WAIT_CHKPT;
+                g_fc.state_tick = now;
+                g_fc.chkpt_send_tick = now;  /* RTT 0ms 表示本地 */
+                g_fc.pipeline_seq = g_fc.next_seq;
+                /* ack_arrived 保留为 1，tick 函数立即处理 */
+            } else {
+                /* 本段发完 → 发送 CHECKPOINT 请求目标报告已收包数
+                 * 注意: ack_arrived 必须在 fc_send_checkpoint 之前清零，
+                 * 因为 1 跳直连时 CHKPT→ACK 可能在 fc_send_checkpoint 内同步完成，
+                 * 若在之后清零会丢弃刚到达的 ACK 导致不必要的超时等待 */
+                g_fc.ack_arrived = 0;
+                fc_send_checkpoint();
+                g_fc.chkpt_retry = 0;
+                g_fc.state = FC_WAIT_CHKPT;
+                g_fc.state_tick = now;
+                g_fc.pipeline_seq = g_fc.next_seq;  /* O1: 缓存当前发送位置，启动流水线预发 */
+            }
         }
         break;
     }
@@ -1217,6 +1404,16 @@ void ble_gateway_img_tick(void)
             /* 通知 APP 进度 */
             fc_notify_progress(0, g_fc.ack_rx_count);
 
+            /* F24: 接收方已收齐全部数据时，跳过剩余段直接发 END
+             * 修复: 之前 window < total 时 (如 W=8, total=23) 即使 rx=23/23 也会
+             * 继续发送 seg=1,2,3 的冗余 CHKPT+数据, 每段各触发一次 BLE 进度通知,
+             * 导致手机收到多次 "23/23" 且浪费 5~15s */
+            if (g_fc.ack_rx_count >= g_img_cache.fc_pkt_count) {
+                g_fc.state = FC_SEND_END;
+                g_fc.state_tick = now;
+                osal_printk("%s FC F24: rx=%d == total, fast-forward to END\r\n",
+                            BLE_GW_LOG, g_fc.ack_rx_count);
+            } else {
             /* O1: 准备下一段 —— 利用流水线已预发的包，跳过已发过的 seq */
             g_fc.prev_rx = g_fc.ack_rx_count;
             g_fc.seg_start = g_fc.next_seq;
@@ -1233,9 +1430,10 @@ void ble_gateway_img_tick(void)
                 if (seg_end > g_img_cache.fc_pkt_count) seg_end = g_img_cache.fc_pkt_count;
 
                 if (g_fc.next_seq >= seg_end) {
-                    /* O1: 流水线已覆盖整段 → 直接发 CHKPT，无需切换到 SENDING 状态 */
-                    fc_send_checkpoint();
+                    /* O1: 流水线已覆盖整段 → 直接发 CHKPT，无需切换到 SENDING 状态
+                     * ack_arrived 在 fc_send_checkpoint 前清零 (同 FC_SENDING 修复) */
                     g_fc.ack_arrived = 0;
+                    fc_send_checkpoint();
                     g_fc.chkpt_retry = 0;
                     g_fc.state_tick = now;
                     g_fc.pipeline_seq = g_fc.next_seq;
@@ -1250,6 +1448,7 @@ void ble_gateway_img_tick(void)
                                 g_fc.seg_start + g_fc.window);
                 }
             }
+            }  /* end F24 else (not all received) */
         } else if (now - g_fc.state_tick >= g_fc.chkpt_timeout) {
             g_fc.chkpt_retry++;
             osal_printk("%s FC CHKPT timeout seg=%d retry=%d/%d (TO=%d)\r\n",
@@ -1266,11 +1465,25 @@ void ble_gateway_img_tick(void)
                 g_fc.state_tick = now;  /* 重置超时计时器 */
             } else {
                 /* CHECKPOINT 多次无响应 —— 视为严重拥塞，重置参数并重发整段 */
+                g_fc.retry_round++;
+                /* F29c: 总重置次数限制防止 FC 无限卡死
+                 * 每次 CHKPT 耗尽 (3 次超时) 计为一轮，超过 MAX_RETRY 轮后放弃 */
+                if (g_fc.retry_round > IMG_GW_MAX_RETRY) {
+                    osal_printk("%s FC give up: %d CHKPT resets without progress\r\n",
+                                BLE_GW_LOG, g_fc.retry_round);
+                    g_fc.state = FC_IDLE;
+                    g_mesh_log_suppress = false;
+                    sle_uart_resume_scan();
+                    fc_stop_turbo_now();
+                    g_img_cache.active = 0;
+                    break;
+                }
                 g_fc.ssthresh = g_fc.window / 2;
                 if (g_fc.ssthresh < FC_W_MIN) g_fc.ssthresh = FC_W_MIN;
                 g_fc.window = FC_W_MIN;
                 g_fc.delay_ms = FC_D_MAX;
                 g_fc.phase = 0;
+                g_fc.chkpt_retry = 0;  /* F29c: 重置 per-segment 计数器 */
 
                 /* 回到段起点重发 */
                 g_fc.next_seq = g_fc.seg_start;
@@ -1332,11 +1545,40 @@ void ble_gateway_img_tick(void)
                         g_fc.state = FC_IDLE;
                         g_mesh_log_suppress = false;
                         sle_uart_resume_scan();
-                        fc_stop_turbo();
+                        fc_stop_turbo_now();
                         g_img_cache.active = 0;
-                    } else {
-                        g_fc.state = FC_SEND_END;
+                    } else if (g_fc.retry_round <= 2) {
+                        /* O15: 轻量重试 - 仅重发 END，避免不必要的全量重发
+                         * 多数节点可能已收到完整数据但 END 丢失;
+                         * 重发 END 后: 数据完整的节点回 RESULT, 数据不完整的回 MISSING */
+                        fc_send_end();
                         g_fc.state_tick = now;
+                        osal_printk("%s FC MCAST: light retry (END only), round %d\r\n",
+                                    BLE_GW_LOG, g_fc.retry_round);
+                    } else {
+                        /* F23: 重播 MCAST_START + 重发全部数据
+                         * 未响应的节点可能从未收到最初的 MCAST_START (网络拓扑变化导致)，
+                         * 需要重播 START 后再重发完整数据，让它们从头开始接收 */
+                        if (g_img_cache.mcast_start_len > 0) {
+                            mesh_broadcast(g_img_cache.mcast_start_frame,
+                                           g_img_cache.mcast_start_len);
+                            osal_printk("%s FC MCAST_START re-broadcast (retry round %d)\r\n",
+                                        BLE_GW_LOG, g_fc.retry_round);
+                        }
+                        /* 重置 FC 为全量重发: 从 seg=0 开始，使用保守参数 */
+                        g_fc.seg_id = 0;
+                        g_fc.seg_start = 0;
+                        g_fc.next_seq = 0;
+                        g_fc.pipeline_seq = 0;
+                        g_fc.prev_rx = 0;
+                        g_fc.ack_arrived = 0;
+                        g_fc.noprogress_count = 0;
+                        g_fc.window = 10;
+                        g_fc.delay_ms = 10;
+                        g_fc.start_delay = 500;
+                        g_fc.state = FC_START_WAIT;
+                        g_fc.state_tick = now;
+                        osal_printk("%s FC MCAST: full resend from seg=0\r\n", BLE_GW_LOG);
                     }
                 }
             }
@@ -1351,7 +1593,7 @@ void ble_gateway_img_tick(void)
                     g_fc.state = FC_IDLE;
                     g_mesh_log_suppress = false;
                     sle_uart_resume_scan();
-                    fc_stop_turbo();
+                    fc_stop_turbo_now();
                     g_img_cache.active = 0;
                 } else {
                     g_fc.state = FC_SEND_END;
@@ -1418,6 +1660,19 @@ void ble_gateway_img_tick(void)
 static void fc_on_checkpoint_ack(const uint8_t *data, uint16_t len)
 {
     if (len < 4) return;
+    /* F21: 自发自收时 D=0 全量发送，ACK 可能在 FC_SENDING 状态到达
+     * (image_receiver 同步处理完所有数据后立即回 ACK，此时 FC 尚未转入 WAIT_CHKPT)
+     * 此时应接受 ACK 而非丢弃，否则会触发不必要的 CHKPT 超时 */
+    if (g_fc.state == FC_SENDING && g_fc.transfer_hops == 0) {
+        /* 自发自收: 将 ACK 暂存，切到 WAIT_CHKPT 后由 tick 函数处理 */
+        uint8_t  seg_id   = data[1];
+        uint16_t rx_count = ((uint16_t)data[2] << 8) | data[3];
+        g_fc.ack_arrived  = 1;
+        g_fc.ack_rx_count = rx_count;
+        osal_printk("%s FC CHKPT_ACK (self-send fast): seg=%d rx=%d/%d\r\n",
+                    BLE_GW_LOG, seg_id, rx_count, g_img_cache.fc_pkt_count);
+        return;
+    }
     if (g_fc.state != FC_WAIT_CHKPT) {
         osal_printk("%s FC CHKPT_ACK ignored (state=%d)\r\n", BLE_GW_LOG, g_fc.state);
         return;
@@ -1433,6 +1688,18 @@ static void fc_on_checkpoint_ack(const uint8_t *data, uint16_t len)
     if (seg_id < g_fc.seg_id) {
         osal_printk("%s FC CHKPT_ACK stale seg=%d (cur=%d), ignored\r\n",
                     BLE_GW_LOG, seg_id, g_fc.seg_id);
+        return;
+    }
+
+    /* F22: 若 rx_count 已等于总包数，说明目标已收齐全部数据，直接跳过无进展检测
+     * 修复: 之前 prev_rx == rx_count == total 时误判为 "无进展"，
+     * 导致已完成的传输反复重传数十秒 */
+    if (rx_count >= g_img_cache.fc_pkt_count) {
+        g_fc.noprogress_count = 0;
+        g_fc.ack_arrived  = 1;
+        g_fc.ack_rx_count = rx_count;
+        osal_printk("%s FC CHKPT_ACK: rx=%d == total, transfer complete\r\n",
+                    BLE_GW_LOG, rx_count);
         return;
     }
 
@@ -1492,7 +1759,7 @@ static void fc_on_missing_bitmap(const uint8_t *data, uint16_t len)
         g_fc.state = FC_IDLE;
         g_mesh_log_suppress = false;
         sle_uart_resume_scan();  /* P5: 传输失败，恢复 SLE 扫描 */
-        fc_stop_turbo();         /* O2: 恢复正常连接间隔 */
+        fc_stop_turbo_now();     /* O2: 恢复正常连接间隔 (立即) */
         g_img_cache.active = 0;
         return;
     }
@@ -1612,6 +1879,14 @@ int ble_gateway_send_image_response(uint16_t src_addr, const uint8_t *data, uint
     }
 
     /* ═══════════════════════════════════════════════════
+     *  F30: 传输完成后丢弃迟到的控制消息
+     *  防止 stale 0x88/0x87/0x85 泄露到手机显示为 [0x0000]AA-88-...
+     * ═══════════════════════════════════════════════════ */
+    if (!g_img_cache.active && (cmd == 0x88 || cmd == 0x87 || cmd == 0x85)) {
+        return 0;
+    }
+
+    /* ═══════════════════════════════════════════════════
      *  单播模式下的上行消息处理 (原有逻辑)
      * ═══════════════════════════════════════════════════ */
 
@@ -1643,6 +1918,12 @@ int ble_gateway_send_image_response(uint16_t src_addr, const uint8_t *data, uint
     /* ── 0x86 RESULT: 传输完成，停止流控引擎，清理缓存 ── */
     if (cmd == 0x86) {
         uint8_t status = (len >= 2) ? data[1] : 0xFF;
+        /* F30: 校验 RESULT 来源: 必须来自当前目标，防止前一目标的迟到 RESULT 误杀当前 FC */
+        if (g_img_cache.active && src_addr != g_img_cache.dst_addr) {
+            osal_printk("%s IMG RESULT from 0x%04X ignored (dst=0x%04X)\r\n",
+                        BLE_GW_LOG, src_addr, g_img_cache.dst_addr);
+            return 0;
+        }
         if (g_fc.state != FC_IDLE) {
             /* 首次收到 RESULT: 停止流控引擎，恢复所有临时状态 */
             osal_printk("%s IMG DONE: src=0x%04X status=%d fc_rounds=%d injected=%d\r\n",
@@ -1655,8 +1936,9 @@ int ble_gateway_send_image_response(uint16_t src_addr, const uint8_t *data, uint
             fc_stop_turbo();         /* O2: 恢复正常连接间隔 */
             g_img_cache.active = 0;
         } else {
-            /* 重复 RESULT: 已在 IDLE 状态，忽略 (避免重复 turbo OFF / 扫描操作) */
+            /* F27: 重复 RESULT → 不转发给手机, 防止 APP 收到多次 "传输成功" */
             osal_printk("%s IMG DONE dup ignored (already IDLE)\r\n", BLE_GW_LOG);
+            return 0;
         }
     }
 
@@ -1839,6 +2121,11 @@ static void gw_write_req_cbk(uint8_t server_id, uint16_t conn_id,
         }
         mpos += meta_len;
 
+        /* F23: 保存 MCAST_START 帧，用于后续重播给迟到节点 */
+        (void)memcpy_s(g_img_cache.mcast_start_frame, sizeof(g_img_cache.mcast_start_frame),
+                       mesh_buf, mpos);
+        g_img_cache.mcast_start_len = mpos;
+
         /* 广播到全网，所有目标节点将检查自己是否在列表中 */
         mesh_broadcast(mesh_buf, mpos);
 
@@ -1975,7 +2262,7 @@ static void gw_write_req_cbk(uint8_t server_id, uint16_t conn_id,
             g_fc.state = FC_IDLE;                /* 重置流控状态机 */
             g_mesh_log_suppress = false;           /* 恢复 Mesh 日志输出 */
             sle_uart_resume_scan();                /* P5: 恢复 SLE 扫描 */
-            fc_stop_turbo();                       /* O2: 恢复默认连接间隔 */
+            fc_stop_turbo_now();                   /* O2: 恢复默认连接间隔 (立即) */
             g_img_cache.active = 0;                /* 清除缓存标记 */
             osal_printk("%s IMG CANCEL: FC stopped, cache cleared\r\n", BLE_GW_LOG);
             mesh_gateway_inject(dst, mesh_buf, mesh_len);
@@ -2095,7 +2382,7 @@ static void gw_conn_state_change_cbk(uint16_t conn_id, bd_addr_t *addr,
         g_fc.state = FC_IDLE;              /* 重置流控状态机 */
         g_mesh_log_suppress = false;       /* 恢复 Mesh 日志 */
         sle_uart_resume_scan();            /* P5: 恢复 SLE 扫描 */
-        fc_stop_turbo();                   /* O2: 恢复默认连接间隔 */
+        fc_stop_turbo_now();               /* O2: 恢复默认连接间隔 (立即) */
         g_img_cache.active = 0;            /* 清除图片缓存标记 */
         osal_printk("%s phone disconnected, restart adv\r\n", BLE_GW_LOG);
         gw_set_adv_data();                 /* 重新设置广播数据 */

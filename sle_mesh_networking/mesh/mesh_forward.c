@@ -705,6 +705,21 @@ void mesh_forward_on_data_received(uint16_t conn_id, const uint8_t *data, uint16
      * 对于直连帧（hop_count == 0），源地址必须与该 conn_id 的锁定地址一致，
      * 否则丢弃以防止路由表污染。 */
     uint16_t sender_mesh_addr = mesh_transport_get_mesh_addr(conn_id);
+
+    /* F17 补丁: Server 端连接的 mesh_addr 快速填充。
+     * P4 补丁让 Server 端的 mesh_addr 初始为 UNASSIGNED，等待 HELLO 到达。
+     * 但 HELLO 周期 5 秒，在此窗口内拓扑查询、反向路由学习等均无法工作。
+     * 优化: 对于直连帧（hop_count == 0），src_addr 就是直连邻居的真实地址，
+     * 可安全地立即填充 mesh_addr，不必等待 HELLO。
+     * 此操作受 mesh_transport_update_mesh_addr() 的 P1-fix 锁定机制保护，
+     * 一旦设定不会被后续帧覆盖。 */
+    if (sender_mesh_addr == MESH_ADDR_UNASSIGNED && header->hop_count == 0) {
+        mesh_transport_update_mesh_addr(conn_id, header->src_addr);
+        sender_mesh_addr = header->src_addr;
+        osal_printk("%s F17: fast addr fill conn_id=%d -> 0x%04X\r\n",
+                    MESH_LOG_TAG, conn_id, header->src_addr);
+    }
+
     if (header->hop_count == 0 &&
         sender_mesh_addr != MESH_ADDR_UNASSIGNED &&
         header->src_addr != sender_mesh_addr) {

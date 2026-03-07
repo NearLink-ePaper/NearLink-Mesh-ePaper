@@ -237,10 +237,10 @@ extern uint16_t g_mesh_node_addr;
                                               * 控制 HELLO 发送、扫描触发、路由清理等周期性任务的检查频率。
                                               * 减小可提高响应速度但增加 CPU 开销。建议范围: 50 ~ 500ms */
 
-#define MESH_FC_TICK_MS             10       /* 流控引擎活跃时的主循环 tick 间隔 (ms)。
-                                              * FC 状态机需要快速驱动以实现高吞吐量图片传输。
-                                              * 与 MAIN_LOOP_INTERVAL 二选一：FC 活跃用此值，空闲用上值。
-                                              * 建议范围: 5 ~ 50ms */
+#define MESH_FC_TICK_MS             5        /* O8: 流控引擎活跃时的主循环 tick 间隔 (ms)。
+                                              * 从 10ms 降至 5ms，减少状态机驱动延迟。
+                                              * FC 需要高频 tick 充分利用 SLE TX 缓冲区。
+                                              * 建议范围: 3 ~ 50ms */
 
 #define MESH_SERVER_INIT_DELAY_MS   2000     /* Mesh 主任务启动后等待 SLE Server 初始化完成的延迟 (ms)。
                                               * 此延迟确保 SSAP 服务注册、广播启动等流程完成后
@@ -268,9 +268,11 @@ extern uint16_t g_mesh_node_addr;
  *       以更快地达到退避上限，避免反复冲击已有连接的稳定性。
  *
  *    3. CONNID_CONFLICT_GIVEUP: 连续冲突次数达到此值后，
- *       永久放弃向该目标发起出站连接。
- *       冲突是 SLE 协议栈的结构性问题，重启设备也不能解决，
- *       因此放弃后不会被退避老化机制重置。
+ *       暂时放弃向该目标发起出站连接。
+ *       冲突由 SLE 协议栈 conn_id 分配问题导致，短期内重试无意义。
+ *       但冲突条目会在 30 分钟后由退避老化机制重置——因为长时间运行后
+ *       SLE 内部 conn_id 池状态会变化，之前冲突的目标可能不再冲突。
+ *       永久黑名单会导致长时间运行后网络分裂无法自愈。
  * ============================================================ */
 #define MESH_OUTGOING_SAFE_CLIENT_LIMIT  4     /* 活跃 Client 连接 ≥ 此值时暂停新的 outgoing 连接 */
 #define MESH_CONNID_CONFLICT_BACKOFF_MULT 4    /* conn_id 冲突退避乘数 (普通失败用 ×2) */
@@ -406,11 +408,18 @@ extern uint16_t g_mesh_node_addr;
  *    吞吐量，但可能导致 SLE 调度器无法及时完成所有连接的调度，
  *    引发连接参数更新失败。建议范围: 0x0C ~ 0x32。
  *
- *  Turbo 控制帧格式：[MESH_TURBO_MAGIC(0xFD)] [MESH_TURBO_ON/OFF]
+ *  Turbo 控制帧格式 (F19 扩展)：[MAGIC(0xFD)] [ON/OFF] [SEQ_HI] [SEQ_LO]
  *    网关在 FC 开始时向目标路径上的中继节点发送 Turbo ON，
- *    FC 结束时发送 Turbo OFF。中继节点收到后调整本地所有连接间隔。
+ *    FC 结束时发送 Turbo OFF。中继节点根据序列号过滤过时帧，
+ *    防止旧 TURBO OFF 覆盖新 TURBO ON (F19 乱序防护)。
+ *    F18: 自发自收 (hops=0) 不发送 Turbo 帧，避免无用广播。
+ *    O9:  成功完成传输后延迟 1 秒广播 TURBO OFF，减少连续传输间的
+ *         快速 ON/OFF 切换对 SLE 连接稳定性的影响。
  * ============================================================ */
-#define MESH_SLE_TURBO_INTV         0x1E     /* Turbo 连接间隔 (slot): 0x1E = 30 slots = 15ms */
+#define MESH_SLE_TURBO_INTV         0x0F     /* O8: Turbo 连接间隔 (slot): 0x0F = 15 slots = 7.5ms
+                                              * 从 0x1E(15ms) 降至 0x0F(7.5ms)，逐跳延时减半。
+                                              * H3863 最多 5 连接, 7.5ms 间隔足够调度。
+                                              * 若出现连接参数更新失败可回调至 0x14(10ms) */
 #define MESH_TURBO_MAGIC            0xFD     /* Turbo 控制帧前缀魔数 */
 #define MESH_TURBO_ON               0x01     /* Turbo 开启命令 */
 #define MESH_TURBO_OFF              0x00     /* Turbo 关闭命令 */
@@ -441,8 +450,20 @@ extern uint16_t g_mesh_node_addr;
  *  若邻居数仍 <2，则允许向小地址节点发起连接。
  *  已有的 is_neighbor() 去重保证不会产生真正的重复连接。
  *  建议范围: 20000 ~ 60000ms
+ *
+ *  MESH_PARTITION_HEAL_TIMEOUT_MS: 分区自愈检测时间。
+ *  若过去此时间段内邻居数持续 < 3，说明网络可能已分裂，
+ *  触发 P3 分区自愈 Fallback，允许主动向小地址节点发起连接，
+ *  以尝试跨分区建立桥接。建议范围: 300000 ~ 900000ms
+ *
+ *  MESH_CONFLICT_COOLDOWN_MS: 冲突退避条目冷却时间。
+ *  因 conn_id 冲突放弃的节点在此时间后重置退避，允许重试。
+ *  长时间后 SLE conn_id 池状态已变化，之前冲突的目标可能不再冲突。
+ *  建议范围: 900000 ~ 3600000ms
  * ============================================================ */
-#define MESH_P3_FALLBACK_TIMEOUT_MS 30000   /* P3 回退超时: 30 秒后允许向小地址连接 */
+#define MESH_P3_FALLBACK_TIMEOUT_MS     30000   /* P3 回退超时: 30 秒后允许向小地址连接 */
+#define MESH_PARTITION_HEAL_TIMEOUT_MS  600000  /* 分区自愈检测: 10 分钟内邻居持续不足则触发 */
+#define MESH_CONFLICT_COOLDOWN_MS       1800000 /* 冲突退避冷却: 30 分钟后允许重试冲突目标 */
 
 /* ============================================================
  *  拓扑查询（全网拓扑收集功能）
