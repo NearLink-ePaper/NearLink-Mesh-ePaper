@@ -533,6 +533,9 @@ static void handle_end(uint16_t src_addr, const uint8_t *data, uint16_t len)
                 IMG_LOG, s_info.width, s_info.height, s_info.total_bytes,
                 s_info.retry_round);
 
+    /* ePaper 刷新由 mesh_main.c 主循环轮询 IMG_STATE_DONE 后触发，
+     * 不在此处调用，避免与主循环的 epaper_trigger_mesh_image 重复导致双刷。 */
+
     (void)src_addr;
 }
 
