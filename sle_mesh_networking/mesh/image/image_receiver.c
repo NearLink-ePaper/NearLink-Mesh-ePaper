@@ -28,7 +28,9 @@
 #include "securec.h"
 #include "errcode.h"
 #include "image_receiver.h"
+#include "image_rle.h"
 #include "mesh_config.h"
+#include "soc_osal.h"
 
 /** 日志标签前缀，所有 osal_printk 输出均以此开头便于过滤 */
 #define IMG_LOG  "[img rx]"
@@ -104,6 +106,78 @@ static uint16_t crc16_ccitt(const uint8_t *data, uint16_t len)
         }
     }
     return crc;
+}
+
+/* === RLE 解压辅助 ========================================================
+ *  CRC 校验通过后，若 mode == IMG_MODE_RLE，将 s_img_buf 中的 RLE
+ *  压缩数据解压为原始 1bpp 像素。
+ *  步骤：
+ *    1. osal_vmalloc 申请临时缓冲区，拷贝压缩数据；
+ *    2. 使用流式 RLE 解码器解压，回调函数依次写入 s_img_buf；
+ *    3. 释放临时缓冲区，更新 total_bytes 为解压后大小。
+ * ====================================================================== */
+
+/** RLE 解码回调写入上下文 */
+typedef struct {
+    uint32_t write_pos;   /**< 当前写入偏移 */
+} rle_write_ctx_t;
+
+/**
+ * @brief  RLE 解码输出回调 —— 将解码字节写入 s_img_buf
+ */
+static void rle_write_to_buf(const uint8_t *data, uint32_t len, void *user_data)
+{
+    rle_write_ctx_t *wctx = (rle_write_ctx_t *)user_data;
+    if (wctx->write_pos + len <= IMG_RX_BUF_SIZE) {
+        (void)memcpy_s(&s_img_buf[wctx->write_pos],
+                       IMG_RX_BUF_SIZE - wctx->write_pos, data, len);
+        wctx->write_pos += len;
+    }
+}
+
+/**
+ * @brief  对 s_img_buf 中的 RLE 压缩数据进行解压
+ * @return true=解压成功，false=OOM 或解码异常
+ */
+static bool rle_decompress_image(void)
+{
+    uint16_t compressed_size = s_info.total_bytes;
+    uint32_t total_pixels = (uint32_t)s_info.width * s_info.height;
+    uint32_t decompressed_size = (total_pixels + 7) / 8;
+
+    if (decompressed_size > IMG_RX_BUF_SIZE) {
+        osal_printk("%s RLE: decompressed %lu > buf %d, OOM\r\n",
+                    IMG_LOG, decompressed_size, IMG_RX_BUF_SIZE);
+        return false;
+    }
+
+    /* 申请临时缓冲区保存压缩数据 */
+    uint8_t *tmp = (uint8_t *)osal_vmalloc(compressed_size);
+    if (tmp == NULL) {
+        osal_printk("%s RLE: vmalloc %d failed\r\n", IMG_LOG, compressed_size);
+        return false;
+    }
+
+    (void)memcpy_s(tmp, compressed_size, s_img_buf, compressed_size);
+    (void)memset_s(s_img_buf, IMG_RX_BUF_SIZE, 0, decompressed_size);
+
+    /* 流式解码 */
+    rle_ctx_t rle;
+    rle_write_ctx_t wctx = { .write_pos = 0 };
+    rle_init(&rle, total_pixels, rle_write_to_buf, &wctx);
+    rle_decode(&rle, tmp, compressed_size);
+
+    osal_vfree(tmp);
+
+    /* 日志：压缩率 (用整数除法避免浮点) */
+    uint32_t ratio_pct = (decompressed_size > 0)
+        ? ((uint32_t)compressed_size * 100) / decompressed_size : 0;
+    osal_printk("%s RLE decode: %dB → %luB (%d%%)\r\n",
+                IMG_LOG, compressed_size, wctx.write_pos, ratio_pct);
+
+    /* 更新 total_bytes 为解压后大小，供上层显示代码使用 */
+    s_info.total_bytes = (uint16_t)decompressed_size;
+    return true;
 }
 
 /* === 发送回复 ============================================================
@@ -356,7 +430,17 @@ static void handle_data(uint16_t src_addr, const uint8_t *data, uint16_t len)
 static void handle_checkpoint(uint16_t src_addr, const uint8_t *data, uint16_t len)
 {
     if (s_info.state != IMG_STATE_RECEIVING) {
-        osal_printk("%s CHKPT: not receiving, ignore\r\n", IMG_LOG);
+        /* P21: 回复特殊 CHKPT_ACK (rx=0xFFFF) 通知网关本节点未在接收状态，
+         * 可能是 START 丢包。网关收到后会立即重发 START，而非被动等 CHKPT 超时 */
+        osal_printk("%s CHKPT: not receiving, reply NOT_RX to 0x%04X\r\n", IMG_LOG, src_addr);
+        if (len >= 2) {
+            uint8_t resp[4];
+            resp[0] = IMG_CMD_CHKPT_ACK;
+            resp[1] = data[1];  /* seg_id echo */
+            resp[2] = 0xFF;
+            resp[3] = 0xFF;     /* 0xFFFF = 未在接收状态 */
+            mesh_send(src_addr, resp, 4);
+        }
         return;
     }
     if (len < 2) return;
@@ -434,6 +518,16 @@ static void handle_end(uint16_t src_addr, const uint8_t *data, uint16_t len)
 
     s_info.state = IMG_STATE_DONE;
     send_result(s_info.gw_addr, IMG_RESULT_OK);
+
+    /* ── RLE 解压 ── CRC 校验通过后，若为 RLE 压缩模式则解压缩 */
+    if (s_info.mode == IMG_MODE_RLE) {
+        if (!rle_decompress_image()) {
+            osal_printk("%s END: RLE decompress failed!\r\n", IMG_LOG);
+            s_info.state = IMG_STATE_ERROR;
+            /* RESULT_OK 已发送，不再重发 ERROR (网关不关心解压结果) */
+            return;
+        }
+    }
 
     osal_printk("%s DONE: %dx%d %dB rounds=%d → buffer ready\r\n",
                 IMG_LOG, s_info.width, s_info.height, s_info.total_bytes,

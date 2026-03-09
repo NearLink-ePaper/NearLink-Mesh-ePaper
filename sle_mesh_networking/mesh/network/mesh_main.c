@@ -819,6 +819,65 @@ static void *mesh_main_task(const char *arg)
             }
         }
 
+        /* ============================================================
+         *  P22c/d: 网络分裂自愈 — 周期性检查并修复
+         *
+         *  两种修复场景:
+         *  (1) P22c 小分区孤立: 唯一邻居 ≤ 1 持续超过阈值,
+         *      说明此节点处于 2 节点小岛. 主动断开 server 连接
+         *      释放槽位, 重新广播, 允许其他分区节点连入.
+         *  (2) P22d 环路消除: server 连接的对端通过路由表中
+         *      其他邻居也可到达, 说明此 server 连接冗余 (形成环路),
+         *      断开以释放 server 槽位给跨分区连接使用.
+         * ============================================================ */
+        {
+            static uint32_t last_p22_ms = 0;
+            static uint32_t p22c_isolation_start_ms = 0;
+            if (now - last_p22_ms >= MESH_P22C_HEAL_INTERVAL_MS) {
+                uint8_t unique_nbrs = mesh_transport_get_unique_neighbor_count();
+
+                /* P22c: 小分区检测 —— 唯一邻居 ≤ 1 且 server 满 */
+                if (unique_nbrs <= 1 &&
+                    mesh_transport_get_server_conn_count() >= MESH_MAX_SERVER_CONN) {
+                    if (p22c_isolation_start_ms == 0) {
+                        p22c_isolation_start_ms = now;
+                    }
+                    if (now - p22c_isolation_start_ms >= MESH_P22C_ISOLATION_THRESHOLD_MS) {
+                        /* 找到 server 连接并断开 */
+                        const mesh_conn_pool_t *pool = mesh_transport_get_pool();
+                        for (uint8_t i = 0; i < MESH_MAX_CONNECTIONS; i++) {
+                            if (pool->entries[i].state == MESH_CONN_STATE_CONNECTED &&
+                                pool->entries[i].role == MESH_ROLE_SERVER) {
+                                osal_printk("%s P22c: isolated (%d unique nbrs for %lus), "
+                                            "drop server conn_id=%d to re-advertise\r\n",
+                                            MESH_LOG_TAG, unique_nbrs,
+                                            (unsigned long)((now - p22c_isolation_start_ms) / 1000),
+                                            pool->entries[i].conn_id);
+                                mesh_transport_force_disconnect(pool->entries[i].conn_id);
+                                p22c_isolation_start_ms = now; /* 重置, 防止连续触发 */
+                                break;
+                            }
+                        }
+                    }
+                } else {
+                    p22c_isolation_start_ms = 0;  /* 邻居恢复, 重置计时 */
+                }
+
+                /* P22d: 环路消除 —— server 连接有替代路径 */
+                if (mesh_transport_get_server_conn_count() >= MESH_MAX_SERVER_CONN &&
+                    unique_nbrs >= 2) {
+                    uint16_t redundant_id = mesh_transport_find_redundant_server();
+                    if (redundant_id != 0xFFFF) {
+                        osal_printk("%s P22d: breaking cycle, drop redundant server conn_id=%d\r\n",
+                                    MESH_LOG_TAG, redundant_id);
+                        mesh_transport_force_disconnect(redundant_id);
+                    }
+                }
+
+                last_p22_ms = now;
+            }
+        }
+
         /* P1: 处理待发送队列 */
         mesh_forward_process_pending_queue();
 
@@ -828,9 +887,10 @@ static void *mesh_main_task(const char *arg)
         /* 定期打印统计 (每60秒), 含 BLE 网关状态 */
         if (now - last_stats_ms >= 60000) {
             mesh_forward_print_stats();
-            osal_printk("%s neighbors=%d, routes=%d, ble_gw=%s\r\n",
+            osal_printk("%s neighbors=%d (unique=%d), routes=%d, ble_gw=%s\r\n",
                         MESH_LOG_TAG,
                         mesh_transport_get_neighbor_count(),
+                        mesh_transport_get_unique_neighbor_count(),
                         mesh_route_get_count(),
                         ble_gateway_is_connected() ? "connected" : "idle");
             last_stats_ms = now;

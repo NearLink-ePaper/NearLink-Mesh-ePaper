@@ -144,6 +144,13 @@ static bool should_update_route(const mesh_route_entry_t *existing,
             return true;
         }
     }
+    /* P23: 允许被动路由之间的跳数优化更新。
+     * 当新旧路由都没有有效序列号时（均为被动学习，如 HELLO 2-hop
+     * 或转发帧反向路由），仍允许跳数更小的路由覆盖跳数更大的路由，
+     * 防止首次学到的次优路径永久锁定，确保 HELLO 持续优化路由。 */
+    if (!new_seq_valid && !existing->dest_seq_valid && new_hops < existing->hop_count) {
+        return true;
+    }
     return false;
 }
 

@@ -648,10 +648,10 @@ static void sle_uart_client_sample_seek_result_info_cbk(sle_seek_result_info_t *
      *       (用于构造菱形等非线性拓扑)
      *
      * P3-Fallback: 两种触发条件 (满足其一即放宽):
-     *   1. 启动初期: 超过 MESH_P3_FALLBACK_TIMEOUT_MS 且邻居 < 2
-     *   2. 分区检测: 邻居数在过去 10 分钟内持续 < 3, 说明网络可能已分裂,
-     *      需要主动向小地址节点发起连接来修复分区.
-     * 已有 is_neighbor() 去重在前面, 不会产生重复连接. */
+     *   1. 启动初期: 超过 MESH_P3_FALLBACK_TIMEOUT_MS 且唯一邻居 < 2
+     *   2. 分区检测: 唯一邻居在过去 PARTITION_HEAL_TIMEOUT 内持续 < 3,
+     *      说明网络可能已分裂, 需要主动向小地址节点发起连接来修复分区.
+     * P22b: 使用唯一邻居计数 (去重), 避免双向连接虚高邻居数. */
     uint16_t my_addr = g_mesh_node_addr;
 #if (MESH_CONNECT_FILTER_ADDR == 0x0000)
     if (remote_mesh_addr != 0 && remote_mesh_addr < my_addr) {
@@ -665,7 +665,8 @@ static void sle_uart_client_sample_seek_result_info_cbk(sle_seek_result_info_t *
             s_last_nbr_sufficient_ms = now_ms;
         }
         uint32_t elapsed = now_ms - s_p3_first_check_ms;
-        uint8_t nbr_count = mesh_transport_get_neighbor_count();
+        /* P22b: 使用唯一邻居数而非连接数, 双向连接不重复计算 */
+        uint8_t nbr_count = mesh_transport_get_unique_neighbor_count();
 
         /* 跟踪邻居充足的最近时间点 */
         if (nbr_count >= 3) {
@@ -740,9 +741,10 @@ static void sle_uart_client_sample_seek_result_info_cbk(sle_seek_result_info_t *
      * 这避免了不必要的 outgoing 连接触发 SLE 协议栈的 conn_id 串台 bug,
      * 从而防止假 disconnect 事件破坏既有连接的稳定性.
      * 阈值从 2 提升到 3: 仅有 2 个邻居的节点仍应尝试建立更多直连,
-     * 以提供网络冗余度, 防止单点故障导致分裂后无法自愈. */
+     * 以提供网络冗余度, 防止单点故障导致分裂后无法自愈.
+     * P22b: 使用去重后的唯一邻居数, 避免双向连接导致虚高计数 */
     {
-        uint8_t nbr_count = mesh_transport_get_neighbor_count();
+        uint8_t nbr_count = mesh_transport_get_unique_neighbor_count();
         if (nbr_count >= 3 && remote_mesh_addr != 0) {
             uint16_t relay_hop = mesh_route_lookup(remote_mesh_addr);
             if (relay_hop != MESH_ADDR_UNASSIGNED) {

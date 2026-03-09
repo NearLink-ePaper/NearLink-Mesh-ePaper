@@ -20,22 +20,28 @@ set(HEADER_LIST ${CMAKE_CURRENT_SOURCE_DIR}/sle_uart_client)
 elseif(DEFINED CONFIG_SAMPLE_SUPPORT_SLE_MESH)
 # ---- Mesh 模式: 同时编译 Server + Client + Mesh 模块 ----
 set(SOURCES_LIST
-    # 原有 server/client 代码 (已修改)
+    # 原有 server/client 代码
     ${CMAKE_CURRENT_SOURCE_DIR}/sle_uart_server/sle_uart_server_adv.c
     ${CMAKE_CURRENT_SOURCE_DIR}/sle_uart_server/sle_uart_server.c
     ${CMAKE_CURRENT_SOURCE_DIR}/sle_uart_client/sle_uart_client.c
-    # Mesh 新增代码
-    ${CMAKE_CURRENT_SOURCE_DIR}/mesh/mesh_main.c
-    ${CMAKE_CURRENT_SOURCE_DIR}/mesh/mesh_transport.c
-    ${CMAKE_CURRENT_SOURCE_DIR}/mesh/mesh_forward.c
-    ${CMAKE_CURRENT_SOURCE_DIR}/mesh/mesh_route.c
-    ${CMAKE_CURRENT_SOURCE_DIR}/mesh/ble_gateway.c
-    ${CMAKE_CURRENT_SOURCE_DIR}/mesh/image_receiver.c
+    # Mesh 组网核心 (network/)
+    ${CMAKE_CURRENT_SOURCE_DIR}/mesh/network/mesh_main.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/mesh/network/mesh_transport.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/mesh/network/mesh_forward.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/mesh/network/mesh_route.c
+    # BLE 网关 (gateway/)
+    ${CMAKE_CURRENT_SOURCE_DIR}/mesh/gateway/ble_gateway.c
+    # 图传模块 (image/)
+    ${CMAKE_CURRENT_SOURCE_DIR}/mesh/image/image_receiver.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/mesh/image/image_rle.c
 )
 set(HEADER_LIST
     ${CMAKE_CURRENT_SOURCE_DIR}/sle_uart_server
     ${CMAKE_CURRENT_SOURCE_DIR}/sle_uart_client
-    ${CMAKE_CURRENT_SOURCE_DIR}/mesh
+    ${CMAKE_CURRENT_SOURCE_DIR}/mesh/common
+    ${CMAKE_CURRENT_SOURCE_DIR}/mesh/network
+    ${CMAKE_CURRENT_SOURCE_DIR}/mesh/gateway
+    ${CMAKE_CURRENT_SOURCE_DIR}/mesh/image
 )
 
 endif()

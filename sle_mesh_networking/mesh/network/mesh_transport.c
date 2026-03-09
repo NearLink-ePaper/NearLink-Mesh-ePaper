@@ -564,6 +564,37 @@ void mesh_transport_update_mesh_addr(uint16_t conn_id, uint16_t mesh_addr)
                 MESH_LOG_TAG, conn_id, entry->mesh_addr, mesh_addr);
     entry->mesh_addr = mesh_addr;
 
+    /* P22a: 双向连接消除 —— 检测同一 mesh_addr 是否已有另一方向的连接。
+     * 若存在, 说明两节点互连 (A 是 B 的 client, B 也是 A 的 client),
+     * 浪费了双方的 server 槽位。按 P3 约定: 地址小的做 Client, 大的做 Server。
+     * 由大地址节点负责断开其 client 连接 (即不符合约定的方向)。 */
+    {
+        bool has_server = false, has_client = false;
+        uint16_t server_conn_id = 0xFFFF, client_conn_id = 0xFFFF;
+        for (uint8_t i = 0; i < MESH_MAX_CONNECTIONS; i++) {
+            mesh_conn_entry_t *e = &g_conn_pool.entries[i];
+            if (e->state != MESH_CONN_STATE_CONNECTED || e->mesh_addr != mesh_addr) continue;
+            if (e->role == MESH_ROLE_SERVER) { has_server = true; server_conn_id = e->conn_id; }
+            if (e->role == MESH_ROLE_CLIENT) { has_client = true; client_conn_id = e->conn_id; }
+        }
+        if (has_server && has_client) {
+            /* 双向连接! 决定断开哪一条: */
+            uint16_t to_drop;
+            if (g_mesh_node_addr < mesh_addr) {
+                /* 我地址小 → 我应该是 client → 断开 server 连接 (对方不该连我) */
+                to_drop = server_conn_id;
+                osal_printk("%s P22a: bidir with 0x%04X, I'm smaller, drop SERVER conn_id=%d\r\n",
+                            MESH_LOG_TAG, mesh_addr, to_drop);
+            } else {
+                /* 我地址大 → 我应该是 server → 断开 client 连接 (我不该连对方) */
+                to_drop = client_conn_id;
+                osal_printk("%s P22a: bidir with 0x%04X, I'm larger, drop CLIENT conn_id=%d\r\n",
+                            MESH_LOG_TAG, mesh_addr, to_drop);
+            }
+            mesh_transport_force_disconnect(to_drop);
+        }
+    }
+
     /* P3 fallback detection: 如果此节点在路由表中是多跳, 但现在成了直连邻居,
      * 说明是远距离弱信号 P3 连接, 标记此邻居 */
     uint8_t table_hops = mesh_route_get_table_hop_count(mesh_addr);
@@ -820,4 +851,109 @@ void mesh_transport_set_turbo_mode(bool enable)
 bool mesh_transport_is_sle_busy(void)
 {
     return g_sle_qos_busy > 0;
+}
+
+/* ============================================================
+ *  P22: 网络分裂自愈 — 双向连接消除 + 冗余环路检测 + 强制断开
+ * ============================================================ */
+
+/** @brief P22b: 获取连接池中去重后的唯一邻居数量 */
+uint8_t mesh_transport_get_unique_neighbor_count(void)
+{
+    uint16_t seen[MESH_MAX_CONNECTIONS];
+    uint8_t count = 0;
+    for (uint8_t i = 0; i < MESH_MAX_CONNECTIONS; i++) {
+        mesh_conn_entry_t *e = &g_conn_pool.entries[i];
+        if (e->state != MESH_CONN_STATE_CONNECTED ||
+            e->mesh_addr == MESH_ADDR_UNASSIGNED) {
+            continue;
+        }
+        bool dup = false;
+        for (uint8_t j = 0; j < count; j++) {
+            if (seen[j] == e->mesh_addr) { dup = true; break; }
+        }
+        if (!dup && count < MESH_MAX_CONNECTIONS) {
+            seen[count++] = e->mesh_addr;
+        }
+    }
+    return count;
+}
+
+/** @brief P22a: 检测是否与指定 mesh_addr 存在双向连接 */
+bool mesh_transport_has_bidirectional(uint16_t mesh_addr)
+{
+    if (mesh_addr == MESH_ADDR_UNASSIGNED) return false;
+    bool has_server = false, has_client = false;
+    for (uint8_t i = 0; i < MESH_MAX_CONNECTIONS; i++) {
+        mesh_conn_entry_t *e = &g_conn_pool.entries[i];
+        if (e->state != MESH_CONN_STATE_CONNECTED || e->mesh_addr != mesh_addr) continue;
+        if (e->role == MESH_ROLE_SERVER) has_server = true;
+        if (e->role == MESH_ROLE_CLIENT) has_client = true;
+    }
+    return has_server && has_client;
+}
+
+/** @brief P22c/d: 断开一条指定 conn_id 的连接并清理连接池 */
+void mesh_transport_force_disconnect(uint16_t conn_id)
+{
+    mesh_conn_entry_t *entry = mesh_transport_find_by_conn_id(conn_id);
+    if (entry == NULL) return;
+
+    uint16_t mesh_addr = entry->mesh_addr;
+    mesh_role_t role = entry->role;
+    uint8_t sle_addr_copy[6];
+    (void)memcpy_s(sle_addr_copy, 6, entry->sle_addr, 6);
+
+    free_entry(entry);
+
+    if (role == MESH_ROLE_SERVER && g_conn_pool.server_count > 0) {
+        g_conn_pool.server_count--;
+    } else if (role == MESH_ROLE_CLIENT && g_conn_pool.client_count > 0) {
+        g_conn_pool.client_count--;
+    }
+    if (g_conn_pool.count > 0) {
+        g_conn_pool.count--;
+    }
+
+    osal_printk("%s P22 force disconnect: conn_id=%d, mesh_addr=0x%04X, role=%s, total=%d\r\n",
+                MESH_LOG_TAG, conn_id, mesh_addr,
+                (role == MESH_ROLE_SERVER) ? "SRV" : "CLI",
+                g_conn_pool.count);
+
+    if (mesh_addr != MESH_ADDR_UNASSIGNED) {
+        mesh_route_on_link_break(mesh_addr);
+    }
+
+    if (role == MESH_ROLE_SERVER) {
+        extern volatile bool g_need_re_announce;
+        g_need_re_announce = true;
+    }
+
+    /* 实际断开 SLE 链路 */
+    sle_addr_t disc_addr = {0};
+    disc_addr.type = 0;
+    (void)memcpy_s(disc_addr.addr, SLE_ADDR_LEN, sle_addr_copy, 6);
+    sle_disconnect_remote_device(&disc_addr);
+}
+
+/** @brief P22d: 查找一条存在冗余路径的 server 连接 (环路检测) */
+uint16_t mesh_transport_find_redundant_server(void)
+{
+    for (uint8_t i = 0; i < MESH_MAX_CONNECTIONS; i++) {
+        mesh_conn_entry_t *e = &g_conn_pool.entries[i];
+        if (e->state != MESH_CONN_STATE_CONNECTED) continue;
+        if (e->role != MESH_ROLE_SERVER) continue;
+        if (e->mesh_addr == MESH_ADDR_UNASSIGNED) continue;
+
+        /* 检查路由表中是否有通过其他邻居到达该节点的条目 */
+        uint16_t route_next = mesh_route_lookup(e->mesh_addr);
+        if (route_next != MESH_ADDR_UNASSIGNED && route_next != e->mesh_addr) {
+            /* 路由表中存在替代路径 (经由另一个节点中继), 此 server 连接冗余 */
+            osal_printk("%s P22d: server conn_id=%d to 0x%04X is redundant "
+                        "(alt route via 0x%04X)\r\n",
+                        MESH_LOG_TAG, e->conn_id, e->mesh_addr, route_next);
+            return e->conn_id;
+        }
+    }
+    return 0xFFFF;
 }

@@ -720,22 +720,36 @@ void mesh_forward_on_data_received(uint16_t conn_id, const uint8_t *data, uint16
                     MESH_LOG_TAG, conn_id, header->src_addr);
     }
 
+    /* P20: 原 P1-fix 在 hop_count==0 且 src_addr != sender_mesh_addr 时直接丢弃。
+     * 但 SLE 协议栈存在 conn_id 路由异常（如 exchange_info 失败后数据被送到
+     * 错误的 conn_id），会导致合法帧被误杀，引发 topo 查询 0 回复等问题。
+     * 改进: 不再 hard-drop，而是标记 identity_mismatch，
+     * 跳过反向路由学习（保留 P1 路由保护），但仍允许帧进入消息分发。
+     * HELLO 的 process_hello() 已有独立的身份校验，不受影响。 */
+    bool identity_mismatch = false;
     if (header->hop_count == 0 &&
         sender_mesh_addr != MESH_ADDR_UNASSIGNED &&
         header->src_addr != sender_mesh_addr) {
-        /* 直连帧的源地址与 conn_id 绑定地址不匹配，丢弃以防止路由污染 */
-        return;
+        identity_mismatch = true;
+        osal_printk("%s P20: conn_id=%d identity mismatch: locked=0x%04X src=0x%04X (allow)\r\n",
+                    MESH_LOG_TAG, conn_id, sender_mesh_addr, header->src_addr);
     }
 
     /* ---- 反向路由学习：从转发帧中提取路由信息 ----
      * 如果帧的源地址不是直连邻居（即该帧经过了多跳转发），
      * 则可学习到：src_addr 可经 sender_mesh_addr 作为下一跳到达。
-     * 路由跳数 = hop_count + 1（因为从本节点到 sender 还需一跳）。 */
-    if (sender_mesh_addr != MESH_ADDR_UNASSIGNED &&
+     * 路由跳数 = hop_count + 1（因为从本节点到 sender 还需一跳）。
+     * P20: 身份不匹配时跳过，避免用错误的 next_hop 污染路由表。
+     * P23: 使用被动学习 (dest_seq=0)，不再以帧序列号作为路由序列号。
+     *   帧的 seq_num 是单调递增的消息序列号 (非 AODV 路由序列号)，
+     *   用它作为路由 seq 会导致图片传输期间每个数据帧都覆盖路由表，
+     *   锁住 HELLO 学习路由的刷新能力，造成跳数在传输过程中反复振荡。 */
+    if (!identity_mismatch &&
+        sender_mesh_addr != MESH_ADDR_UNASSIGNED &&
         header->src_addr != sender_mesh_addr) {
         /* src 不是直连邻居，学习反向路由：src_addr 可经 sender_mesh_addr 到达 */
         mesh_route_update(header->src_addr, sender_mesh_addr,
-                          header->hop_count + 1, header->seq_num);
+                          header->hop_count + 1, 0);  /* P23: 被动学习 */
     }
 
     /* 直连邻居的单播帧：更新/添加 1 跳路由。

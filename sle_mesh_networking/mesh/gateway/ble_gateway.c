@@ -1485,6 +1485,22 @@ void ble_gateway_img_tick(void)
                 g_fc.phase = 0;
                 g_fc.chkpt_retry = 0;  /* F29c: 重置 per-segment 计数器 */
 
+                /* P21: CHKPT 耗尽可能是 START 丢失导致目标不在接收状态，
+                 * 补发 START 后再重发段数据，确保目标能正常接收 */
+                if (!g_img_cache.is_multicast && g_img_cache.start_len > 0) {
+                    uint8_t sbuf[16];
+                    sbuf[0] = 0x04;
+                    (void)memcpy_s(&sbuf[1], sizeof(sbuf) - 1,
+                                   g_img_cache.start_payload, g_img_cache.start_len);
+                    uint8_t slen = 1 + g_img_cache.start_len;
+                    if (slen >= 5) {
+                        sbuf[3] = (g_img_cache.fc_pkt_count >> 8) & 0xFF;
+                        sbuf[4] = g_img_cache.fc_pkt_count & 0xFF;
+                    }
+                    mesh_gateway_inject(g_img_cache.dst_addr, sbuf, slen);
+                    osal_printk("%s FC P21: re-inject START (CHKPT exhausted)\r\n", BLE_GW_LOG);
+                }
+
                 /* 回到段起点重发 */
                 g_fc.next_seq = g_fc.seg_start;
                 g_fc.pipeline_seq = g_fc.seg_start;  /* O1: 重置流水线 */
@@ -1683,6 +1699,33 @@ static void fc_on_checkpoint_ack(const uint8_t *data, uint16_t len)
 
     osal_printk("%s FC CHKPT_ACK: seg=%d rx=%d/%d\r\n",
                 BLE_GW_LOG, seg_id, rx_count, g_img_cache.fc_pkt_count);
+
+    /* P21: rx_count == 0xFFFF 表示目标节点不在接收状态 (START 丢失)
+     * 立即重发 START，重置到当前段起点，等 START 传播后重发 CHKPT 验证 */
+    if (rx_count == 0xFFFF && !g_img_cache.is_multicast) {
+        osal_printk("%s FC P21: target NOT_RECEIVING, re-inject START to 0x%04X\r\n",
+                    BLE_GW_LOG, g_img_cache.dst_addr);
+        if (g_img_cache.start_len > 0) {
+            uint8_t sbuf[16];
+            sbuf[0] = 0x04;
+            (void)memcpy_s(&sbuf[1], sizeof(sbuf) - 1,
+                           g_img_cache.start_payload, g_img_cache.start_len);
+            uint8_t slen = 1 + g_img_cache.start_len;
+            if (slen >= 5) {
+                sbuf[3] = (g_img_cache.fc_pkt_count >> 8) & 0xFF;
+                sbuf[4] = g_img_cache.fc_pkt_count & 0xFF;
+            }
+            mesh_gateway_inject(g_img_cache.dst_addr, sbuf, slen);
+        }
+        /* 重置当前段，留 800ms 等 START 多跳传播后自动重发 CHKPT */
+        g_fc.next_seq = g_fc.seg_start;
+        g_fc.pipeline_seq = g_fc.seg_start;
+        g_fc.chkpt_retry = 0;
+        g_fc.noprogress_count = 0;
+        g_fc.state_tick = osal_get_tick_ms();
+        g_fc.chkpt_timeout = 800;
+        return;
+    }
 
     /* Fix: 过滤过期 ACK —— 只接受当前段或比当前段新的 ACK，丢弃旧 ACK */
     if (seg_id < g_fc.seg_id) {

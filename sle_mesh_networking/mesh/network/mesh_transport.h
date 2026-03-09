@@ -549,6 +549,40 @@ void mesh_transport_set_turbo_mode(bool enable);
  */
 bool mesh_transport_is_sle_busy(void);
 
+/* ============================================================
+ *  P22: 网络分裂自愈
+ * ============================================================ */
+
+/**
+ * @brief  获取连接池中去重后的唯一邻居数量
+ * @return 去重后的邻居数 (不含 mesh_addr == UNASSIGNED 的条目)
+ * @note   双向连接到同一节点只计为 1 个邻居。
+ */
+uint8_t mesh_transport_get_unique_neighbor_count(void);
+
+/**
+ * @brief  P22a: 检测是否与指定 mesh_addr 存在双向连接
+ * @param  mesh_addr  待检测的对端 Mesh 地址
+ * @return true = 同时存在 server 和 client 连接到该节点
+ */
+bool mesh_transport_has_bidirectional(uint16_t mesh_addr);
+
+/**
+ * @brief  P22c/d: 断开一条指定 conn_id 的连接并清理连接池
+ * @param  conn_id  要断开的连接 ID
+ * @note   内部完成: 释放池条目、递减计数、通知路由层、SLE 断开。
+ *         若 conn_id 为 server 角色则设置 g_need_re_announce。
+ */
+void mesh_transport_force_disconnect(uint16_t conn_id);
+
+/**
+ * @brief  P22d: 查找一条存在冗余路径的 server 连接 (环路检测)
+ * @return 冗余 server 连接的 conn_id; 未找到返回 0xFFFF
+ * @note   判定: server 连接的对端 mesh_addr 在路由表中有通过
+ *         其他邻居到达的条目 (即存在替代路径)。
+ */
+uint16_t mesh_transport_find_redundant_server(void);
+
 #ifdef __cplusplus
 #if __cplusplus
 }
