@@ -49,3 +49,59 @@ config SUPPORT_SLE_CENTRAL
 config SUPPORT_BLE
     bool
     default y if SAMPLE_SUPPORT_SLE_MESH
+
+config EPD_MASTER_BUS_ID
+    int
+    prompt "Choose SPI master bus id."
+    depends on SAMPLE_SUPPORT_SLE_MESH_NETWORKING
+    depends on SAMPLE_SUPPORT_SLE_MESH
+    default 0
+
+config EPD_BUSY_PIN
+    int
+    prompt "Choose e-Paper BUSY pin."
+    depends on SAMPLE_SUPPORT_SLE_MESH_NETWORKING
+    depends on SAMPLE_SUPPORT_SLE_MESH
+    default 12
+
+config EPD_DIN_PIN
+    int
+    prompt "Choose e-Paper DIN pin."
+    depends on SAMPLE_SUPPORT_SLE_MESH_NETWORKING
+    depends on SAMPLE_SUPPORT_SLE_MESH
+    default 9
+
+config EPD_CLK_PIN
+    int
+    prompt "Choose e-Paper CLK pin."
+    depends on SAMPLE_SUPPORT_SLE_MESH_NETWORKING
+    depends on SAMPLE_SUPPORT_SLE_MESH
+    default 7
+
+config EPD_CS_PIN
+    int
+    prompt "Choose e-Paper CS pin."
+    depends on SAMPLE_SUPPORT_SLE_MESH_NETWORKING
+    depends on SAMPLE_SUPPORT_SLE_MESH
+    default 8
+
+config EPD_RST_PIN
+    int
+    prompt "Choose e-Paper RES pin."
+    depends on SAMPLE_SUPPORT_SLE_MESH_NETWORKING
+    depends on SAMPLE_SUPPORT_SLE_MESH
+    default 2
+
+config EPD_PWR_PIN
+    int
+    prompt "Choose e-Paper PWR pin."
+    depends on SAMPLE_SUPPORT_SLE_MESH_NETWORKING
+    depends on SAMPLE_SUPPORT_SLE_MESH
+    default 11
+
+config EPD_DC_PIN
+    int
+    prompt "Choose e-Paper DC pin."
+    depends on SAMPLE_SUPPORT_SLE_MESH_NETWORKING
+    depends on SAMPLE_SUPPORT_SLE_MESH
+    default 10

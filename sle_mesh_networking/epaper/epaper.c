@@ -88,11 +88,11 @@ void EPD_refresh(void) {
     EPD_ReadBusy();
 }
 
-/// @brief LUT_GC 占位（7色 ACeP 屏无需 LUT 下载，保留接口兼容性）
+/// @brief LUT_GC 占位（保留接口兼容性）
 void EPD_lut_GC(void) {
 }
 
-/// @brief LUT_DU 占位（7色 ACeP 屏无需 LUT 下载，保留接口兼容性）
+/// @brief LUT_DU 占位（保留接口兼容性）
 void EPD_lut_DU(void) {
 }
 

@@ -97,9 +97,7 @@
 #include "image_receiver.h"
 
 /* (e) ePaper 显示（仅在同时启用墨水屏样例时编译） */
-#if defined(CONFIG_ENABLE_EPAPER_SAMPLE)
 #include "epaper.h"
-#endif
 
 /* ===================================================================
  *  Section 2: 外部函数声明
@@ -776,9 +774,7 @@ static void *mesh_main_task(const char *arg)
     uint32_t last_scan_ms = 0;
     uint32_t last_route_cleanup_ms = 0;
     uint32_t last_stats_ms = 0;
-#if defined(CONFIG_ENABLE_EPAPER_SAMPLE)
     bool img_epaper_triggered = false;  /* 防止同一张图重复触发刷屏 */
-#endif
 
     while (1) {
         uint32_t now = osal_get_tick_ms();
@@ -915,7 +911,6 @@ static void *mesh_main_task(const char *arg)
         image_receiver_tick();
         ble_gateway_img_tick();  /* v2: 流控状态机驱动 */
 
-#if defined(CONFIG_ENABLE_EPAPER_SAMPLE)
         /* ---- ePaper: 图片接收完成后触发墨水屏刷新 ---- */
         {
             const img_rx_info_t *img = image_receiver_get_info();
@@ -928,7 +923,6 @@ static void *mesh_main_task(const char *arg)
                 img_epaper_triggered = false;  /* 新传输开始，清除触发标志 */
             }
         }
-#endif
 
         /* P4: 流控活跃时使用快速 tick (MESH_FC_TICK_MS)，减少主循环空等延迟 */
         osal_msleep(ble_gateway_fc_is_active() ? MESH_FC_TICK_MS : MESH_MAIN_LOOP_INTERVAL_MS);
