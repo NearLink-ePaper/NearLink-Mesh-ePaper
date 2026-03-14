@@ -35,19 +35,20 @@ extern "C" {
  * ====================================================================== */
 
 /** 图片接收缓冲区大小（字节）。
- *  计算方式：480×800 二值化 → (480/8)×800 = 48000 字节。
- *  调优建议：若实际分辨率更小，可适当缩减以节省 RAM。 */
-#define IMG_RX_BUF_SIZE         48000
+ *  4bpp RAW: 240×360/2 = 43200 字节。JPEG: 480×800 高质量可达 60-90KB，需 > 80KB。
+ *  SRAM 内存布局：BSS 增益直接占用堆空间（堆收缩）。
+ *  任务栈已回退至原始值 ~37KB，节省 ~55KB 堆，96KB BSS 增量下堆余量约 19KB。 */
+#define IMG_RX_BUF_SIZE         96000
 
 /** 单个分包最大载荷（字节）。
  *  O4 优化：从 200 提升到 480，与 mesh_config.h 中 IMG_FC_PKT_PAYLOAD 保持一致。
  *  取值范围：不能超过 mesh 底层 MTU 减去 5 字节头部开销。 */
 #define IMG_PKT_PAYLOAD         480
 
-/** 分包总数上限，向上取整：48000 / 480 = 100 包（当前实际值） */
-#define IMG_MAX_PKTS            ((IMG_RX_BUF_SIZE + IMG_PKT_PAYLOAD - 1) / IMG_PKT_PAYLOAD)  /* 240 */
-/** 位图字节数，每 bit 对应一个 seq：ceil(240/8) = 30 字节 */
-#define IMG_BITMAP_BYTES        ((IMG_MAX_PKTS + 7) / 8)   /* 30 bytes */
+/** 分包总数上限，向上取整：96000 / 480 = 200 包 */
+#define IMG_MAX_PKTS            ((IMG_RX_BUF_SIZE + IMG_PKT_PAYLOAD - 1) / IMG_PKT_PAYLOAD)  /* 200 */
+/** 位图字节数，每 bit 对应一个 seq：ceil(200/8) = 25 字节 */
+#define IMG_BITMAP_BYTES        ((IMG_MAX_PKTS + 7) / 8)   /* 25 bytes */
 
 /** 补包最大重试轮次。超过此轮次后放弃接收并上报 CRC_ERR。
  *  取值范围：1~10，建议 3~5；过大会延长失败恢复时间。 */
@@ -98,6 +99,7 @@ extern "C" {
  * ====================================================================== */
 #define IMG_MODE_RAW            0x00    /**< 原始 1bpp 像素，无压缩 */
 #define IMG_MODE_RLE            0x01    /**< RLE 游程编码压缩的 1bpp 像素 */
+#define IMG_MODE_JPEG           0x02    /**< JPEG 压缩，接收端解码+抖动+4bpp输出 */
 
 /* === 传输模式 =============================================================
  *  在 START 报文中由源端指定，影响接收端是否逐包回 ACK。
@@ -188,10 +190,36 @@ const img_rx_info_t *image_receiver_get_info(void);
 const uint8_t *image_receiver_get_buffer(void);
 
 /**
+ * @brief  获取图片接收缓冲区（可写，供 WiFi Socket 直接写入）
+ * @return 指向 s_img_buf[IMG_RX_BUF_SIZE] 的可写指针
+ * @note   调用方需确保 state != IMG_STATE_RECEIVING 避免冲突
+ */
+uint8_t *image_receiver_get_buffer_writable(void);
+
+/**
  * @brief  强制重置接收模块至 IDLE 状态
  * @note   清除进度并停止 RESULT 重发，可在刷屏完成后调用以准备下次传输。
  */
 void image_receiver_reset(void);
+
+/**
+ * @brief  自发自收直接加载: 跳过逐包注入回环，直接从源缓冲区拷贝到接收缓冲区
+ *
+ * @param  src_buf       源数据指针 (g_img_cache.buf)
+ * @param  total_bytes   图片总字节数
+ * @param  pkt_count     FC 分包数 (仅用于设置内部状态)
+ * @param  width         图片宽度
+ * @param  height        图片高度
+ * @param  mode          图片模式 (IMG_MODE_RAW / RLE / JPEG)
+ * @param  expected_crc  期望 CRC16
+ * @return IMG_RESULT_OK(0) 成功, IMG_RESULT_CRC_ERR(4) CRC 不匹配
+ *
+ * @note   绕过 mesh loopback 路径，消除自发自收时可能的数据路径问题。
+ *         函数内部: 1) CRC 预校验源缓冲区  2) memcpy 到 s_img_buf  3) 设置 DONE 状态
+ */
+uint8_t image_receiver_load_direct(const uint8_t *src_buf, uint16_t total_bytes,
+                                   uint16_t pkt_count, uint16_t width, uint16_t height,
+                                   uint8_t mode, uint16_t expected_crc);
 
 #ifdef __cplusplus
 }

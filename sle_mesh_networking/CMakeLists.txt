@@ -34,9 +34,14 @@ set(SOURCES_LIST
     # 图传模块 (image/)
     ${CMAKE_CURRENT_SOURCE_DIR}/mesh/image/image_receiver.c
     ${CMAKE_CURRENT_SOURCE_DIR}/mesh/image/image_rle.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/mesh/image/tjpgd.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/mesh/image/jpeg_decoder.c
     # ePaper 模块 (epaper/)
     ${CMAKE_CURRENT_SOURCE_DIR}/epaper/epaper.c
     ${CMAKE_CURRENT_SOURCE_DIR}/epaper/epaper_init.c
+    # WiFi SoftAP + Socket 图传 (wifi/)
+    ${CMAKE_CURRENT_SOURCE_DIR}/wifi/wifi_softap.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/wifi/wifi_socket_server.c
 )
 set(HEADER_LIST
     ${CMAKE_CURRENT_SOURCE_DIR}/sle_uart_server
@@ -46,6 +51,7 @@ set(HEADER_LIST
     ${CMAKE_CURRENT_SOURCE_DIR}/mesh/gateway
     ${CMAKE_CURRENT_SOURCE_DIR}/mesh/image
     ${CMAKE_CURRENT_SOURCE_DIR}/epaper
+    ${CMAKE_CURRENT_SOURCE_DIR}/wifi
 )
 
 endif()

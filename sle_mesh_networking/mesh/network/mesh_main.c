@@ -99,6 +99,10 @@
 /* (e) ePaper 显示（仅在同时启用墨水屏样例时编译） */
 #include "epaper.h"
 
+/* (f) WiFi SoftAP + Socket 图传 */
+#include "wifi_softap.h"
+#include "wifi_socket_server.h"
+
 /* ===================================================================
  *  Section 2: 外部函数声明
  *
@@ -764,10 +768,25 @@ static void *mesh_main_task(const char *arg)
         osal_printk("%s UART callback register failed: 0x%x\r\n", MESH_LOG_TAG, ret);
     }
 
-    /* ---- 5. 进入活跃状态 ---- */
+    /* ---- 5. 进入活跃状态，并立即启动 WiFi SoftAP ---- */
     g_node_state = MESH_NODE_STATE_ACTIVE;
     osal_printk("%s ===== Mesh node 0x%04X ACTIVE =====\r\n",
                 MESH_LOG_TAG, g_mesh_node_addr);
+
+    /* WiFi SoftAP 在初始化完成后立即启动（不依赖 BLE 连接）
+     * SSID = sle_gw_XXXX，与 BLE 广播名称一致，方便用户识别
+     * BLE/WiFi 互斥由 wifi_socket_server 层处理: BLE 激活时拒绝 WiFi 传图 */
+    {
+        char wifi_ssid[20];
+        (void)snprintf_s(wifi_ssid, sizeof(wifi_ssid), sizeof(wifi_ssid) - 1,
+                         "sle_gw_%04X", (unsigned)g_mesh_node_addr);
+        wifi_socket_server_set_name(wifi_ssid);
+        if (wifi_softap_start(wifi_ssid) == 0) {
+            wifi_socket_server_start();
+        } else {
+            osal_printk("%s WiFi SoftAP start failed\r\n", MESH_LOG_TAG);
+        }
+    }
 
     /* ---- 6. 主循环 ---- */
     uint32_t last_hello_ms = 0;
@@ -793,7 +812,8 @@ static void *mesh_main_task(const char *arg)
         uint32_t scan_interval = (mesh_transport_get_neighbor_count() == 0)
                                  ? 2000 : MESH_SCAN_INTERVAL_MS;
         if (now - last_scan_ms >= scan_interval) {
-            if (mesh_transport_get_client_conn_count() < MESH_MAX_CLIENT_CONN) {
+            if (mesh_transport_get_client_conn_count() < MESH_MAX_CLIENT_CONN
+                    && !ble_gateway_fc_is_active()) {
                 sle_uart_start_scan();
             }
             last_scan_ms = now;
@@ -840,9 +860,16 @@ static void *mesh_main_task(const char *arg)
             if (now - last_p22_ms >= MESH_P22C_HEAL_INTERVAL_MS) {
                 uint8_t unique_nbrs = mesh_transport_get_unique_neighbor_count();
 
-                /* P22c: 小分区检测 —— 唯一邻居 ≤ 1 且 server 满 */
+                /* P22c: 小分区检测 —— 唯一邻居 ≤ 1 且 server 满
+                 * 豁免条件 (不触发断连):
+                 *   1. 网关已连手机 — 断开唯一邻居会导致网关孤立
+                 *   2. 流控引擎活跃 — FC 传输期间断连导致传输失败
+                 *   3. 图片接收中 — 正在接收图片数据，断连导致丢包 */
                 if (unique_nbrs <= 1 &&
-                    mesh_transport_get_server_conn_count() >= MESH_MAX_SERVER_CONN) {
+                    mesh_transport_get_server_conn_count() >= MESH_MAX_SERVER_CONN &&
+                    !ble_gateway_is_connected() &&
+                    !ble_gateway_fc_is_active() &&
+                    image_receiver_get_info()->state != IMG_STATE_RECEIVING) {
                     if (p22c_isolation_start_ms == 0) {
                         p22c_isolation_start_ms = now;
                     }
@@ -900,6 +927,7 @@ static void *mesh_main_task(const char *arg)
             last_stats_ms = now;
         }
 
+
         /* ---- BLE 断线: 不再暂停 SLE, BLE/SLE 并行广播 ---- */
         if (ble_gateway_needs_reconnect() && !ble_gateway_is_connected()) {
             osal_printk("%s BLE phone lost, SLE continues (parallel mode)\r\n", MESH_LOG_TAG);
@@ -917,8 +945,11 @@ static void *mesh_main_task(const char *arg)
             if (img->state == IMG_STATE_DONE && !img_epaper_triggered) {
                 img_epaper_triggered = true;
                 epaper_trigger_mesh_image(image_receiver_get_buffer(),
-                                          img->width, img->height);
-                image_receiver_reset();  /* 重置状态机，准备接收下一张 */
+                                          IMG_RX_BUF_SIZE,
+                                          img->width, img->height, img->mode,
+                                          img->total_bytes);
+                /* 注意: 不在此处 reset — ePaper 任务异步解码 JPEG 期间需要缓冲区,
+                 * 由 ePaper 任务在数据传输完成后调用 image_receiver_reset() */
             } else if (img->state != IMG_STATE_DONE) {
                 img_epaper_triggered = false;  /* 新传输开始，清除触发标志 */
             }

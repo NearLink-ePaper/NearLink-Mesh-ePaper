@@ -43,7 +43,10 @@ void EPD_Show7Block(void);
 void EPD_Clear(void);
 void EPD_sleep(void);
 void EPD_display_1bpp(const uint8_t *buf, uint16_t width, uint16_t height);
+void EPD_display_4bpp(const uint8_t *buf, uint16_t width, uint16_t height);
 
-void epaper_trigger_mesh_image(const uint8_t *buf, uint16_t width, uint16_t height);
+void epaper_trigger_mesh_image(const uint8_t *buf, uint32_t buf_size,
+                               uint16_t width, uint16_t height,
+                               uint8_t mode, uint16_t data_size);
 
 #endif

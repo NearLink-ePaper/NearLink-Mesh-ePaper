@@ -97,7 +97,7 @@ extern uint16_t g_mesh_node_addr;
  *  MESH_MCAST_MAX_TARGETS 定义单次组播最多支持的目标节点数。
  *  受限于 BLE MTU 和 Mesh 帧空间，建议不超过 8 个。
  * ============================================================ */
-#define MESH_MCAST_MAX_TARGETS  8   /**< 单次组播最大目标节点数 */
+#define MESH_MCAST_MAX_TARGETS  16  /**< 单次组播最大目标节点数 */
 
 /* ============================================================
  *  SLE 广播名称
@@ -283,14 +283,14 @@ extern uint16_t g_mesh_node_addr;
  *
  *  控制 mesh_forward.c 中的帧去重、路由表容量和待发送队列。
  * ============================================================ */
-#define MESH_DEDUP_CACHE_SIZE       64       /* 帧去重环形缓存大小（条目数）。
+#define MESH_DEDUP_CACHE_SIZE       128      /* 帧去重环形缓存大小（条目数）。
                                               * 每条记录一个 (src, seq) 对，防止同一帧被重复处理。
-                                              * 缓存满后覆盖最旧条目。网络节点数越多或广播频率越高，
-                                              * 应适当增大此值。建议范围: 32 ~ 128 */
+                                              * 缓存满后覆盖最旧条目。32 节点网络广播量大，需要更大缓存。
+                                              * 建议范围: 32 ~ 128 */
 
-#define MESH_ROUTE_TABLE_SIZE       32       /* AODV 路由表最大条目数。
+#define MESH_ROUTE_TABLE_SIZE       64       /* AODV 路由表最大条目数。
                                               * 必须 ≥ 网络中可达节点总数，否则新路由会淘汰旧路由。
-                                              * 建议范围: 16 ~ 64 */
+                                              * 64 条支持 32 节点网络绰绰有余。建议范围: 16 ~ 64 */
 
 #define MESH_PENDING_QUEUE_SIZE     8        /* 待发送队列大小（条目数）。
                                               * 当目标节点的路由未知时，帧暂存于此队列，
@@ -357,15 +357,16 @@ extern uint16_t g_mesh_node_addr;
                                               * 数据帧经过某条路由时，该路由的过期时间延长此值。
                                               * 建议范围: 5000 ~ 30000ms */
 
-#define MESH_AODV_RREQ_CACHE_SIZE    16      /* RREQ 去重缓存大小（条目数）。
+#define MESH_AODV_RREQ_CACHE_SIZE    32      /* RREQ 去重缓存大小（条目数）。
                                               * 防止同一 RREQ 被重复处理/转发，每条记录
-                                              * (originator, rreq_id) 对。建议范围: 8 ~ 32 */
+                                              * (originator, rreq_id) 对。32 节点网络需更大缓存。
+                                              * 建议范围: 8 ~ 32 */
 
-#define MESH_AODV_RREQ_WAIT_SIZE     4       /* 同时等待 RREP 的 RREQ 最大并发数。
+#define MESH_AODV_RREQ_WAIT_SIZE     8       /* 同时等待 RREP 的 RREQ 最大并发数。
                                               * 即同时向多个不同目标发起路由发现的上限。
-                                              * 建议范围: 2 ~ 8 */
+                                              * 增大到 8 支持更多并发路由发现。建议范围: 2 ~ 8 */
 
-#define MESH_AODV_RERR_MAX_DEST      8       /* 单个 RERR 帧最多携带的不可达目标数。
+#define MESH_AODV_RERR_MAX_DEST      16      /* 单个 RERR 帧最多携带的不可达目标数。
                                               * 建议范围: 4 ~ 16 */
 
 #define MESH_AODV_SEQ_INIT           1       /* 节点启动时的初始路由序列号 */
@@ -416,10 +417,10 @@ extern uint16_t g_mesh_node_addr;
  *    O9:  成功完成传输后延迟 1 秒广播 TURBO OFF，减少连续传输间的
  *         快速 ON/OFF 切换对 SLE 连接稳定性的影响。
  * ============================================================ */
-#define MESH_SLE_TURBO_INTV         0x0F     /* O8: Turbo 连接间隔 (slot): 0x0F = 15 slots = 7.5ms
-                                              * 从 0x1E(15ms) 降至 0x0F(7.5ms)，逐跳延时减半。
-                                              * H3863 最多 5 连接, 7.5ms 间隔足够调度。
-                                              * 若出现连接参数更新失败可回调至 0x14(10ms) */
+#define MESH_SLE_TURBO_INTV         0x14     /* O8: Turbo 连接间隔 (slot): 0x14 = 20 slots = 10ms
+                                              * 从 0x0F(7.5ms) 回调至 0x14(10ms)，
+                                              * 7.5ms 在多跳 MCAST 中频繁触发 disc_reason:0x7，
+                                              * 10ms 平衡吞吐量与 SLE 链路稳定性。 */
 #define MESH_TURBO_MAGIC            0xFD     /* Turbo 控制帧前缀魔数 */
 #define MESH_TURBO_ON               0x01     /* Turbo 开启命令 */
 #define MESH_TURBO_OFF              0x00     /* Turbo 关闭命令 */
@@ -436,7 +437,7 @@ extern uint16_t g_mesh_node_addr;
  *    28 为中等偏低优先级，不影响系统关键任务。
  *    若图片传输对实时性要求极高，可降至 25~26。
  * ============================================================ */
-#define MESH_TASK_STACK_SIZE        0x1800   /* Mesh 主任务栈大小: 6144 字节 */
+#define MESH_TASK_STACK_SIZE        0x2000   /* Mesh 主任务栈大小: 8192 字节。waterline=0x7bc(2KB), FC 期间栈上 485B mesh_buf, 8KB 留 2x+ 余量。释放 4KB 堆给 WiFi+BT OAL */
 #define MESH_TASK_PRIO              28       /* Mesh 主任务优先级 (LiteOS, 数值越小越高) */
 
 /* ============================================================
@@ -495,8 +496,8 @@ extern uint16_t g_mesh_node_addr;
  *  MESH_TOPO_MAX_NODES: 单次拓扑收集最多记录的节点数。
  *    超出容量的节点将被忽略。
  * ============================================================ */
-#define MESH_TOPO_COLLECT_TIMEOUT_MS   2000   /* 拓扑收集窗口 (ms) */
-#define MESH_TOPO_MAX_NODES            16     /* 最大收集节点数 */
+#define MESH_TOPO_COLLECT_TIMEOUT_MS   5000   /* 拓扑收集窗口 (ms)，32 节点多跳网络需要更长收集时间 */
+#define MESH_TOPO_MAX_NODES            32     /* 最大收集节点数，支持 32 节点组网 */
 #define MESH_TOPO_MAGIC                0xFE   /* 拓扑协议帧前缀魔数 */
 #define MESH_TOPO_REQ                  0x01   /* 0xFE 0x01 = 拓扑请求（由 Gateway 广播） */
 #define MESH_TOPO_RESP                 0x02   /* 0xFE 0x02 = 拓扑响应（各节点单播回 Gateway） */

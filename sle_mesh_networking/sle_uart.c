@@ -107,7 +107,7 @@ static void uart_init_config(void)
 
 /* ---------- Server 专用宏定义 ---------- */
 #define SLE_UART_SERVER_DELAY_COUNT         5           /**< Server 启动前延迟计数（暂未使用） */
-#define SLE_UART_TASK_STACK_SIZE            0x1200      /**< Server 任务栈大小，4608 字节；比 Client 大，因为需要消息队列 */
+#define SLE_UART_TASK_STACK_SIZE            0x2400      /**< Server 任务栈大小，9216 字节（回退至原始值，节省堆支持 96KB 缓冲区）*/
 #define SLE_ADV_HANDLE_DEFAULT              1           /**< 默认广播句柄编号，取值 >= 1 */
 #define SLE_UART_SERVER_MSG_QUEUE_LEN       5           /**< 消息队列最大消息条数 */
 #define SLE_UART_SERVER_MSG_QUEUE_MAX_SIZE  32          /**< 单条消息最大字节数 */

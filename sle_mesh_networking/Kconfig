@@ -105,3 +105,10 @@ config EPD_DC_PIN
     depends on SAMPLE_SUPPORT_SLE_MESH_NETWORKING
     depends on SAMPLE_SUPPORT_SLE_MESH
     default 10
+
+config SUPPORT_WIFI_SOFTAP
+    bool
+    default y if SAMPLE_SUPPORT_SLE_MESH
+    help
+        Enable WiFi SoftAP for Socket image transfer.
+        PC connects to device hotspot and sends images via TCP.

@@ -854,6 +854,31 @@ bool mesh_transport_is_sle_busy(void)
 }
 
 /* ============================================================
+ *  F30: SLE TX 互斥锁 — 防止 BT 回调与 Mesh 任务并发 SLE 发送
+ *
+ *  H3863 SLE SDK 的 ssaps_notify_indicate / ssapc_write_req 不可重入。
+ *  BT Core 任务 (server_write_cbk → forward_broadcast → SLE send) 和
+ *  Mesh 任务 (FC burst → mesh_broadcast → SLE send) 存在并发风险。
+ *  tx_lock 期间，forward 路径会跳过 SLE 发送（丢弃转发帧）。
+ * ============================================================ */
+static volatile uint8_t g_sle_tx_guard = 0;
+
+void mesh_transport_tx_lock(void)
+{
+    g_sle_tx_guard = 1;
+}
+
+void mesh_transport_tx_unlock(void)
+{
+    g_sle_tx_guard = 0;
+}
+
+bool mesh_transport_is_tx_locked(void)
+{
+    return g_sle_tx_guard > 0;
+}
+
+/* ============================================================
  *  P22: 网络分裂自愈 — 双向连接消除 + 冗余环路检测 + 强制断开
  * ============================================================ */
 

@@ -53,7 +53,7 @@ extern "C" {
 #define MESH_FRAME_VERSION      0x01        /* 协议版本号 */
 #define MESH_HEADER_SIZE        16          /* 帧头固定长度 (字节) */
 #define MESH_MAX_PAYLOAD        504         /* 最大有效载荷 = MTU(520) - 帧头(16) */
-#define MESH_DEFAULT_TTL        7           /* 默认 TTL，建议范围: 4 ~ 15 */
+#define MESH_DEFAULT_TTL        10          /* 默认 TTL，增大到 10 跳支持更大网络直径 */
 
 /* ============================================================
  *  Mesh 地址常量

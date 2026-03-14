@@ -293,6 +293,47 @@ void EPD_display_1bpp(const uint8_t *buf, uint16_t width, uint16_t height) {
     EPD_refresh();
 }
 
+/// @brief 显示 4bpp packed 图像数据并刷新（含 90° CW 旋转）
+/// @param buf    4bpp packed 数据：每字节 2 像素 (高nibble=左, 低nibble=右)
+///               行步长 = width/2 字节, 总大小 = (width/2)*height
+/// @param width  图像宽度（像素，须为偶数），对应 portrait 方向
+/// @param height 图像高度（像素），对应 portrait 方向
+void EPD_display_4bpp(const uint8_t *buf, uint16_t width, uint16_t height) {
+    uint32_t erow, ecol;
+    EPD_SendCommand(0x10);
+    /* 90° CW rotation: portrait(width×height) → landscape(EPD_WIDTH×EPD_HEIGHT)
+     * ePaper(erow, ecol) ← source(height-1-ecol, erow)
+     * Valid for width==EPD_HEIGHT(480) && height==EPD_WIDTH(800) */
+    for (erow = 0; erow < EPD_HEIGHT; erow++) {
+        uapi_watchdog_kick();
+        for (ecol = 0; ecol < EPD_WIDTH / 2; ecol++) {
+            uint32_t lx = ecol * 2;      /* left pixel x on ePaper */
+            uint32_t rx = ecol * 2 + 1;  /* right pixel x on ePaper */
+            uint8_t left, right;
+            /* left pixel: source row = height-1-lx, source col = erow */
+            if (lx < height && erow < width) {
+                uint32_t sr = height - 1 - lx;
+                uint32_t sc = erow;
+                uint8_t byte = buf[sr * (width / 2) + sc / 2];
+                left = (sc & 1) ? (byte & 0x0F) : (byte >> 4);
+            } else {
+                left = EPD_WHITE;
+            }
+            /* right pixel: source row = height-1-rx, source col = erow */
+            if (rx < height && erow < width) {
+                uint32_t sr = height - 1 - rx;
+                uint32_t sc = erow;
+                uint8_t byte = buf[sr * (width / 2) + sc / 2];
+                right = (sc & 1) ? (byte & 0x0F) : (byte >> 4);
+            } else {
+                right = EPD_WHITE;
+            }
+            EPD_SendData((uint8_t)((left << 4) | right));
+        }
+    }
+    EPD_refresh();
+}
+
 /// @brief 进入深度睡眠模式（先 POWER_OFF 再 DEEP_SLEEP）
 void EPD_sleep(void) {
     EPD_SendCommand(0x02); /* POWER OFF */

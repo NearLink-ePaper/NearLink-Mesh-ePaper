@@ -29,6 +29,7 @@
 #include "errcode.h"
 #include "image_receiver.h"
 #include "image_rle.h"
+#include "jpeg_decoder.h"
 #include "mesh_config.h"
 #include "soc_osal.h"
 
@@ -516,25 +517,29 @@ static void handle_end(uint16_t src_addr, const uint8_t *data, uint16_t len)
         return;
     }
 
-    s_info.state = IMG_STATE_DONE;
+    /* 先发送 RESULT 告知网关 CRC 通过 (不设 DONE, 等后处理完成) */
     send_result(s_info.gw_addr, IMG_RESULT_OK);
 
-    /* ── RLE 解压 ── CRC 校验通过后，若为 RLE 压缩模式则解压缩 */
+    /* ── 后处理: 根据 mode 做解压/解码 ── */
     if (s_info.mode == IMG_MODE_RLE) {
+        /* RLE 解压 */
         if (!rle_decompress_image()) {
             osal_printk("%s END: RLE decompress failed!\r\n", IMG_LOG);
             s_info.state = IMG_STATE_ERROR;
-            /* RESULT_OK 已发送，不再重发 ERROR (网关不关心解压结果) */
             return;
         }
+    } else if (s_info.mode == IMG_MODE_JPEG) {
+        /* JPEG 数据留在 s_img_buf, ePaper 任务流式解码+显示 */
+        osal_printk("%s JPEG: %d bytes, defer to ePaper task\r\n",
+                    IMG_LOG, s_info.total_bytes);
     }
+
+    /* 后处理完成，缓冲区数据就绪，现在才标记 DONE */
+    s_info.state = IMG_STATE_DONE;
 
     osal_printk("%s DONE: %dx%d %dB rounds=%d → buffer ready\r\n",
                 IMG_LOG, s_info.width, s_info.height, s_info.total_bytes,
                 s_info.retry_round);
-
-    /* ePaper 刷新由 mesh_main.c 主循环轮询 IMG_STATE_DONE 后触发，
-     * 不在此处调用，避免与主循环的 epaper_trigger_mesh_image 重复导致双刷。 */
 
     (void)src_addr;
 }
@@ -785,6 +790,11 @@ const uint8_t *image_receiver_get_buffer(void)
     return s_img_buf;
 }
 
+uint8_t *image_receiver_get_buffer_writable(void)
+{
+    return s_img_buf;
+}
+
 /**
  * @brief  强制重置接收模块至 IDLE 状态
  * @note   清除接收进度和 RESULT 重发计数器。
@@ -797,4 +807,62 @@ void image_receiver_reset(void)
     s_info.result_retries = 0;
     s_mcast_count = 0;
     osal_printk("%s reset → IDLE\r\n", IMG_LOG);
+}
+
+/**
+ * @brief  自发自收直接加载: 跳过逐包注入回环，直接 memcpy + CRC 校验
+ *
+ * 流程:
+ *   1. 长度校验 (total_bytes <= IMG_RX_BUF_SIZE)
+ *   2. CRC16 预校验 src_buf，不匹配则立即返回 CRC_ERR
+ *   3. memcpy src_buf → s_img_buf
+ *   4. 设置 s_info 为 DONE 状态 (供 ePaper 任务检测并刷屏)
+ *   5. 若 mode == JPEG，留待 ePaper 任务流式解码
+ */
+uint8_t image_receiver_load_direct(const uint8_t *src_buf, uint16_t total_bytes,
+                                   uint16_t pkt_count, uint16_t width, uint16_t height,
+                                   uint8_t mode, uint16_t expected_crc)
+{
+    if (src_buf == NULL || total_bytes == 0 || total_bytes > IMG_RX_BUF_SIZE) {
+        osal_printk("%s DIRECT: invalid params total=%d\r\n", IMG_LOG, total_bytes);
+        return IMG_RESULT_OOM;
+    }
+
+    /* CRC 预校验: 在源缓冲区上直接计算，避免无意义的 memcpy */
+    uint16_t actual_crc = crc16_ccitt(src_buf, total_bytes);
+    if (actual_crc != expected_crc) {
+        osal_printk("%s DIRECT: cache CRC MISMATCH expect=0x%04X actual=0x%04X\r\n",
+                    IMG_LOG, expected_crc, actual_crc);
+        return IMG_RESULT_CRC_ERR;
+    }
+
+    /* 取消可能正在进行的接收 */
+    if (s_info.state == IMG_STATE_RECEIVING) {
+        osal_printk("%s DIRECT: cancel prev transfer\r\n", IMG_LOG);
+    }
+
+    /* 直接拷贝: 单次 memcpy 替代 90 次逐包回环注入 */
+    (void)memcpy_s(s_img_buf, IMG_RX_BUF_SIZE, src_buf, total_bytes);
+
+    /* 设置接收完成状态 */
+    (void)memset_s(&s_info, sizeof(s_info), 0, sizeof(s_info));
+    s_info.state       = IMG_STATE_DONE;
+    s_info.width       = width;
+    s_info.height      = height;
+    s_info.mode        = mode;
+    s_info.xfer_mode   = IMG_XFER_FAST;
+    s_info.total_bytes = total_bytes;
+    s_info.pkt_count   = pkt_count;
+    s_info.rx_count    = pkt_count;
+    s_info.gw_addr     = 0;  /* 自发自收无需回复 */
+
+    /* JPEG: 留待 ePaper 任务流式解码 */
+    if (mode == IMG_MODE_JPEG) {
+        osal_printk("%s DIRECT: JPEG %d bytes, defer to ePaper task\r\n",
+                    IMG_LOG, total_bytes);
+    }
+
+    osal_printk("%s DIRECT: %dx%d %dB CRC OK → buffer ready\r\n",
+                IMG_LOG, width, height, total_bytes);
+    return IMG_RESULT_OK;
 }

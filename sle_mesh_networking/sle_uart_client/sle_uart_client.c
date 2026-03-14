@@ -120,6 +120,7 @@ static sle_addr_t g_outgoing_addr = { 0 };    /**< 当前出站连接的目标 S
 static uint32_t g_outgoing_start_ms = 0;      /**< 出站连接发起时间戳（超时保护用） */
 static bool g_seek_stop_to_connect = false;   /**< true=扫描停止是为了发起连接, false=清理性停止 */
 static bool g_scan_paused = false;            /**< P5: FC 传输期间持久暂停标记 */
+static bool g_seek_running = false;           /**< seek 是否正在运行，只有 true 时才调用 sle_stop_seek */
 #define MESH_OUTGOING_TIMEOUT_MS  8000        /**< 出站连接超时 8 秒，防止永久堵塞 */
 
 /* P9: 记住最近超时的 outgoing 目标地址
@@ -482,8 +483,13 @@ void sle_uart_pause_scan(void)
 #if defined(CONFIG_SAMPLE_SUPPORT_SLE_MESH)
     g_scan_paused = true;
     g_seek_stop_to_connect = false;
-#endif
+    if (g_seek_running) {
+        g_seek_running = false;
+        sle_stop_seek();
+    }
+#else
     sle_stop_seek();
+#endif
 }
 
 /**
@@ -519,12 +525,20 @@ void sle_uart_start_scan(void)
     }
 #endif
     /* 先停止可能残留的扫描, 确保干净状态
-     * 标记为清理性停止, seek_disable_cbk 不会触发连接 */
+     * 标记为清理性停止, seek_disable_cbk 不会触发连接
+     * 只有 seek 真正在运行时才调用 sle_stop_seek，
+     * 避免对已停止的 seek 再次 stop 产生 error=20 回调及 OAL id=3 内存泄漏 */
 #if defined(CONFIG_SAMPLE_SUPPORT_SLE_MESH)
     g_seek_stop_to_connect = false;
-#endif
+    if (g_seek_running) {
+        g_seek_running = false;
+        sle_stop_seek();
+        osal_msleep(50);
+    }
+#else
     sle_stop_seek();
     osal_msleep(50);
+#endif
 
     sle_seek_param_t param = { 0 };
     param.own_addr_type = 0;
@@ -538,6 +552,9 @@ void sle_uart_start_scan(void)
     param.seek_window[0] = SLE_SEEK_WINDOW_DEFAULT;
     sle_set_seek_param(&param);
     sle_start_seek();
+#if defined(CONFIG_SAMPLE_SUPPORT_SLE_MESH)
+    g_seek_running = true;
+#endif
 }
 
 /**
@@ -805,6 +822,9 @@ static void sle_uart_client_sample_seek_result_info_cbk(sle_seek_result_info_t *
  */
 static void sle_uart_client_sample_seek_disable_cbk(errcode_t status)
 {
+#if defined(CONFIG_SAMPLE_SUPPORT_SLE_MESH)
+    g_seek_running = false;  /* seek 已停止，无论原因都清除运行标记 */
+#endif
     if (status != 0) {
         osal_printk("%s seek_disable_cbk, status error = %x\r\n", SLE_UART_CLIENT_LOG, status);
     }

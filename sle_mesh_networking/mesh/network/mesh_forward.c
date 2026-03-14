@@ -428,7 +428,7 @@ static bool validate_frame(const mesh_header_t *header, uint16_t data_len)
  */
 static bool verify_crc(const uint8_t *data, uint16_t total_len, uint16_t saved_crc)
 {
-    mesh_frame_t tmp;
+    static mesh_frame_t tmp;
     if (total_len > sizeof(mesh_frame_t)) {
         return false;
     }
@@ -539,7 +539,12 @@ static void process_hello(uint16_t conn_id, const uint8_t *payload, uint16_t pay
  */
 static void forward_unicast(const uint8_t *data, uint16_t total_len, uint16_t conn_id)
 {
-    mesh_frame_t fwd;
+    /* F30: FC 活跃期间暂停单播转发, 避免并发 SLE 发送崩溃 */
+    if (mesh_transport_is_tx_locked()) {
+        return;
+    }
+
+    static mesh_frame_t fwd;
     if (frame_prepare_forward(&fwd, data, total_len) == 0) {
         return;
     }
@@ -605,7 +610,12 @@ static void forward_unicast(const uint8_t *data, uint16_t total_len, uint16_t co
  */
 static void forward_broadcast(const uint8_t *data, uint16_t total_len, uint16_t conn_id)
 {
-    mesh_frame_t fwd;
+    /* F30: FC 活跃期间暂停广播转发, 避免 BT 回调与 Mesh 任务并发调用 SLE 发送 API */
+    if (mesh_transport_is_tx_locked()) {
+        return;
+    }
+
+    static mesh_frame_t fwd;
     if (frame_prepare_forward(&fwd, data, total_len) == 0) {
         return;
     }
@@ -845,7 +855,8 @@ errcode_t mesh_forward_send_unicast(uint16_t dst_addr, const uint8_t *data, uint
         return ERRCODE_SUCC;
     }
 
-    mesh_frame_t frame;
+    /* static: 避免 520B mesh_frame_t 占用栈空间，单播发送路径栈深度同样很深 */
+    static mesh_frame_t frame;
     uint16_t total_len = mesh_forward_build_frame(&frame, MESH_MSG_UNICAST, dst_addr, data, len);
     if (total_len == 0) {
         return ERRCODE_FAIL;
@@ -907,7 +918,8 @@ errcode_t mesh_forward_send_broadcast(const uint8_t *data, uint16_t len)
         return ERRCODE_INVALID_PARAM;
     }
 
-    mesh_frame_t frame;
+    /* static: 避免 520B mesh_frame_t 占用栈空间，防止 MCAST FC 广播路径栈溢出 */
+    static mesh_frame_t frame;
     uint16_t total_len = mesh_forward_build_frame(&frame, MESH_MSG_BROADCAST,
                                                    MESH_ADDR_BROADCAST, data, len);
     if (total_len == 0) {
@@ -949,7 +961,7 @@ errcode_t mesh_forward_send_hello(void)
     }
 
     /* 构建帧，然后将 TTL 强制设为 1（HELLO 仅传播一跳），并重新计算 CRC */
-    mesh_frame_t frame;
+    static mesh_frame_t frame;
     uint16_t total_len = mesh_forward_build_frame(&frame, MESH_MSG_HELLO,
                                                    MESH_ADDR_BROADCAST,
                                                    hello_payload, idx);
@@ -1004,7 +1016,7 @@ void mesh_forward_process_pending_queue(void)
 
         if (next_hop != MESH_ADDR_UNASSIGNED) {
             /* 路由已发现：构建单播帧并发送，然后释放队列槽位 */
-            mesh_frame_t frame;
+            static mesh_frame_t frame;
             uint16_t total_len = mesh_forward_build_frame(&frame, MESH_MSG_UNICAST, dst,
                                                            g_pending_queue[i].data,
                                                            g_pending_queue[i].data_len);
@@ -1048,7 +1060,7 @@ void mesh_forward_flush_pending(uint16_t dest_addr)
 
     for (uint8_t i = 0; i < MESH_PENDING_QUEUE_SIZE; i++) {
         if (g_pending_queue[i].used && g_pending_queue[i].dst_addr == dest_addr) {
-            mesh_frame_t frame;
+            static mesh_frame_t frame;
             uint16_t total_len = mesh_forward_build_frame(&frame, MESH_MSG_UNICAST, dest_addr,
                                                            g_pending_queue[i].data,
                                                            g_pending_queue[i].data_len);

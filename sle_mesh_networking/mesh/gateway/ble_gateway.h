@@ -125,6 +125,44 @@ bool ble_gateway_fc_is_active(void);
  */
 int ble_gateway_send_image_response(uint16_t src_addr, const uint8_t *data, uint16_t len);
 
+/**
+ * @brief  启动 WiFi TOPO 查询（广播 TOPO_REQ，收集响应）
+ */
+void ble_gateway_start_wifi_topo(void);
+
+/**
+ * @brief  读取 WiFi TOPO 查询结果，返回节点数
+ * @param  addrs  输出: 节点地址数组
+ * @param  hops   输出: 对应节点的跳数
+ * @param  max    数组最大容量
+ * @return 实际节点数
+ */
+uint8_t ble_gateway_read_wifi_topo(uint16_t *addrs, uint8_t *hops, uint8_t max);
+
+/**
+ * @brief  获取图片缓存区 (g_img_cache.buf)，供 WiFi 任务直接写入图片数据
+ */
+uint8_t *ble_gateway_get_wifi_img_buf(void);
+
+/**
+ * @brief  返回 WiFi 图片缓存区大小 (字节)，供外部作大小上限检查
+ */
+uint32_t ble_gateway_wifi_img_buf_size(void);
+
+/**
+ * @brief  设置 WiFi FC 转发元数据并触发传输
+ *         图片数据必须已通过 ble_gateway_get_wifi_img_buf() 写入缓存
+ * @return 0=成功, 负=错误(FC忙/OOM/阶载带)
+ */
+int ble_gateway_wifi_setup_fc(uint16_t dst_addr, uint32_t data_size,
+                              uint16_t w, uint16_t h, uint8_t mode);
+
+/**
+ * @brief  获取 WiFi FC 传输结果
+ * @return 0=成功, 1=失败, -1=进行中
+ */
+int8_t ble_gateway_wifi_get_fc_result(void);
+
 #ifdef __cplusplus
 }
 #endif
